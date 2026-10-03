@@ -567,6 +567,13 @@ void ImsRegistration::on_aka(AkaJob* job) {
         }
         struct sa ps = server_addr_;
         sa_set_port(&ps, server_.port_s);
+        
+        struct sip_conncfg cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.srcport = cfg_.sec_port;
+        if (sip_conncfg_set(sip_, &ps, &cc))
+            warning("ims: cannot pin the TCP source port to %u\n",
+                    cfg_.sec_port);
         char route[128];
         re_snprintf(route, sizeof(route), "sip:%J;transport=%s", &ps,
                     cfg_.sec_proto.c_str());
