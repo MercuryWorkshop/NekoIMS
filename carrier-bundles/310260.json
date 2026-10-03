@@ -16,7 +16,6 @@
     "audio",
     "+g.3gpp.smsip"
   ],
-  "audio_codecs": "PCMU",
   "expires": 600000,
   "sms": {
     "format": "3gpp",
