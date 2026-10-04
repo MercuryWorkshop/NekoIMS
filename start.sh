@@ -29,7 +29,7 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD=$REPO/build
-RUN_DIR=/run/nekoims
+if [ "$(uname -s)" = Darwin ]; then RUN_DIR=/var/run/nekoims; else RUN_DIR=/run/nekoims; fi
 SOCK=$RUN_DIR/simcard.sock
 PCSCF_FILE=$RUN_DIR/pcscf
 NETNS=ims
@@ -142,8 +142,8 @@ for r in readers():
         c.connect()
         c.disconnect()
         sys.exit(0)
-    except Exception:
-        pass
+    except Exception as e:
+        print(e)
 sys.exit(1)
 EOF
 }
