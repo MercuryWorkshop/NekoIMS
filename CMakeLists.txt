@@ -279,6 +279,12 @@ FetchContent_MakeAvailable(re)
 target_link_libraries(re-objs PRIVATE mbedcrypto)
 target_link_libraries(re PRIVATE $<BUILD_INTERFACE:mbedcrypto>)
 
+# libre's APPLE branch skips src/tls/stub.c (it assumes OpenSSL), leaving
+# tls_* undefined for baresip. We build without OpenSSL, so add the stub.
+if(APPLE)
+  target_sources(re-objs PRIVATE "${re_SOURCE_DIR}/src/tls/stub.c")
+endif()
+
 ##############################################################################
 #
 # baresip (static, modules compiled into libbaresip)
