@@ -1,0 +1,40 @@
+{
+  "name": "Freedom Mobile",
+  "mccmnc": "302490",
+  "domain": "mobilefrdm.ca",
+  "identity": "isim",
+  "aka_app": "isim",
+  "epdg": "epdg.epc.mnc490.mcc302.pub.3gppnetwork.org",
+  "apn": "ims",
+  "mmsc": "http://mms.freedommobile.ca",
+  "epdg_auth": "eap",
+  "transport": "udp",
+  "sec_agree": false,
+  "pcscf_match_family": true,
+  "p_access_network_info": "IEEE-802.11;country=CA;i-wlan-node-id=ffffffffffff",
+  "contact_features": [
+    "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"",
+    "+sip.instance=\"<{imei_urn}>\"",
+    "audio",
+    "+g.3gpp.smsip"
+  ],
+  "expires": 600000,
+  "sms": {
+    "format": "3gpp",
+    "smsc": "sip:ims.freedommobile.ca"
+  },
+  "notes": [
+    "Tested with a 302490 SIM (ISIM present) over strongSwan + NekoIMS: SWu tunnel and IMS registration work. Wi-Fi calling had to be enabled on the line first (in a supported phone, E911 address included), and imei/+sip.instance set to that phone's IMEI; before that the ePDG answered the EAP-AKA response with EAP-Failure / AUTHENTICATION_FAILED. Bundle started from Apple's FreedomMobile_ca carrier bundle; AOSP CarrierConfig (carrierid 1895) has nothing IMS-relevant.",
+    "Home domain mobilefrdm.ca, from the ISIM (EF.DOMAIN; IMPI 302490<MSIN>@mobilefrdm.ca, one IMPU sip:302490<MSIN>@mobilefrdm.ca). The iOS bundle's CarrierDomain ims.freedommobile.ca is wrong for IMS: a REGISTER built on it gets a bare 403 Forbidden from the P-CSCF within ~35 ms, before any 401. mobilefrdm.ca also matches the bundle's conference/XCAP/BSF hosts.",
+    "Identities come from the ISIM like AT&T (identity/aka_app \"isim\"). The ISIM IMPU is IMSI-based; msisdn should still be set for From/P-Preferred-Identity.",
+    "The ePDG assigns an IPv6-only address but hands out IPv4 and IPv6 P-CSCFs (two of each, IPv4 listed first, order varies between dials); only the IPv6 ones are reachable over the tunnel. pcscf_match_family makes the strongSwan dialer list the IPv6 ones first.",
+    "No sec-agree/IPsec on Gm: with Require/Proxy-Require: sec-agree the P-CSCF answers REGISTER with 420 Bad Extension.",
+    "ePDG is the 3GPP discovery name; it resolves (199.7.158.65 at time of writing, Netify tags 208.98.222.247 as a Freedom Wi-Fi calling gateway too). iOS: AuthenticationMethod None + EAP-AKA, ValidateRemoteCertificate false, so EAP-only (RFC 5998). IKE identity 0<IMSI>@nai.epc.mnc490.mcc302.3gppnetwork.org.",
+    "iOS IKE proposal: AES-256 / SHA2-256 integrity / PRF SHA2-256 / DH group 14. Child SA: AES-256 / SHA2-256. If the SWu client's defaults don't offer these, expect NO_PROPOSAL_CHOSEN.",
+    "sms.smsc is a placeholder (AT&T-style SIP URI). Freedom is GSM/3GPP, so format 3gpp is solid, but read the real SMSC off the SIM (AT+CSCA? on the modem) and use that as a +1... number if this one gets rejected.",
+    "iOS sets MaxUdpMessageSize 1200, so big requests (INVITEs) will go over TCP per RFC 3261 18.1.1, same as AT&T: TCP needs to be in the SA policies or incoming calls won't land.",
+    "CountryOfOriginationFormat PANI: the country comes from P-Access-Network-Info, hence country=CA. Media: AMR-WB mode-set 0,1,2, SDP max-red and bandwidth specifiers on, incoming DTMF enabled.",
+    "iOS also adds +g.3gpp.mid-call;+g.3gpp.srvcc-alerting;+g.3gpp.ps2cs-srvcc-orig-pre-alerting to REGISTER/INVITE contacts. SRVCC stuff, probably irrelevant over Wi-Fi; add them if registration is picky.",
+    "MMS: APN mms.freedommobile.ca, proxy 74.115.197.70:8080. Other bits: voicemail pilot +16477001777, conference URI sip:conf@mobilefrdm.ca, XCAP xcap.mobilefrdm.ca:80 with BSF bsf.mobilefrdm.ca:80 (APN xcap.freedommobile.ca), entitlement server https://deg.freedommobile.ca/ium-OEMInterface/servlet/IUMServlet. EnableWiFiCallingWithoutEntitlement false, so WFC may need to be provisioned on the account."
+  ]
+}

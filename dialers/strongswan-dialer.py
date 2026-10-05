@@ -612,6 +612,20 @@ def write_state(path: str, state: dict | None):
     os.replace(tmp, path)
 
 
+def tunnel_family_first(pcscfs: list[str], vips: list[str]) -> list[str]:
+    """P-CSCFs in an address family the tunnel has go first (stable order
+    otherwise). Some ePDGs hand out IPv4 and IPv6 P-CSCFs on a tunnel that
+    only has one family (Freedom: IPv6-only, IPv4 ones listed first), and
+    nekoims takes the first line of the pcscf file. Bundle flag
+    "pcscf_match_family"."""
+    fams = {":" in v for v in vips}
+    ordered = sorted(pcscfs, key=lambda p: (":" in p) not in fams)
+    if ordered and (":" in ordered[0]) not in fams:
+        log(f"warning: no P-CSCF matches the tunnel's address family "
+            f"({' '.join(vips)}): {' '.join(pcscfs)}")
+    return ordered
+
+
 def write_pcscf(path: str, pcscfs: list[str] | None):
     """One P-CSCF per line, read by nekoims when no -p/"pcscf" is given.
     Removed while there is no tunnel (or no P-CSCF) so it is never stale."""
@@ -779,6 +793,8 @@ def main():
                 continue
 
             vips = local_vips(cmd)
+            if bundle.get("pcscf_match_family", False):
+                pcscfs = tunnel_family_first(pcscfs, vips)
             tunnel.configure(vips)
             write_state(state_path, {"netns": args.netns,
                                      "ifname": args.ifname,
