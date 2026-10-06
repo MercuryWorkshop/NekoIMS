@@ -16,6 +16,22 @@ runs NekoIMS inside the tunnel's `ims` netns, using the P-CSCF the ePDG
 assigned. It asks for sudo after building. `./start.sh --help` lists the
 options; arguments after `--` go to nekoims.
 
+### Quick start (Windows, VoWiFi)
+```
+powershell -ExecutionPolicy Bypass -File start.ps1
+```
+The same steps as `start.sh`: builds NekoIMS (Visual Studio with the C++
+workload, Ninja and Git needed), re-runs itself as Administrator, starts
+`simcard-server/server.py` on `http://127.0.0.1:8888` for the PC/SC reader
+(or uses a SIM server that already answers there, or wherever `-SimServer`
+points, e.g. `-SimServer http://host:5309` for one on another machine), runs
+mkconfig, dials the ePDG and runs NekoIMS. `Get-Help .\start.ps1` or the top
+of the file lists the options; arguments after `--` go to nekoims. Python 3
+with pyscard is needed for the SIM server and mkconfig.
+
+Windows on ARM uses the x86_64 strongSwan build due to what seems to be a compiler but on llvm arm64 windows targets with varargs. NekoIMS itself builds natively.
+`sec_agree` (IMS IPsec, needed by AT&T) is not implemented on Windows yet.
+
 ### Dependencies (should be populated via cmake)
 * libcurl
 * BareSIP
@@ -107,3 +123,6 @@ card. This is useful for peering with asterisk or using gnome-calls or another s
   (`/proc/1/ns/net` for the host's) or a name from `/run/netns`.
 * `audio_codecs`: codecs offered to the external UA (default
   `PCMU/8000,PCMA/8000`; `AMR-WB/16000` and `AMR/8000` also available)
+
+On Windows, set `listen` to the LAN address (or `127.0.0.1` for a softphone
+on the same machine). Network namespaces are not used on windows, you do not need to set netns (nor is that option supported).
