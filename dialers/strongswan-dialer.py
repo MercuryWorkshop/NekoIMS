@@ -35,6 +35,20 @@ plugin is used when present to learn the P-CSCF from the ePDG.
 
 Requires root, iproute2, a charon binary and the strongSwan python `vici`
 package.
+
+On Windows there are no network namespaces or XFRM interfaces. charon-svc
+(the fork's Windows build, see --remote) runs kernel-libipsec: ESP is done in
+userspace and the tunnel is a Wintun adapter (--ifname, "NekoIMS"), which
+gets the virtual IPs, a host route to each P-CSCF and a default route with a
+high metric. Windows' strong host model sends whatever is bound to the
+tunnel address out of the tunnel, and the rest of the host keeps its own
+routes. IKE runs from random local ports since Windows' IKEEXT service holds
+500/4500, and ESP is always UDP-encapsulated. vici and the SIM server are on
+loopback TCP (127.0.0.1:4502 and :8888). Run it as Administrator:
+
+    python simcard-server/server.py
+    python dialers/strongswan-dialer.py --remote <windows zip URL>
+    build/nekoims.exe     (reads the P-CSCF from %ProgramData%\\NekoIMS)
 """
 from __future__ import annotations
 
@@ -55,21 +69,33 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUNDLES_DEFAULT = os.path.join(REPO, "carrier-bundles")
-SIMCARD_SOCKET_DEFAULT = "/run/nekoims/simcard.sock"
-RUN_DIR = "/run/nekoims"
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    RUN_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                           "NekoIMS")
+    # Python has no AF_UNIX on Windows, see simcard-server/server.py
+    SIMCARD_DEFAULT = "http://127.0.0.1:8888"
+    VICI_PORT = 4502  # charon-svc's default vici port
+else:
+    RUN_DIR = "/run/nekoims"
+    SIMCARD_DEFAULT = "unix:/run/nekoims/simcard.sock"
 
-CHARON_CANDIDATES = ("/usr/local/libexec/ipsec/charon",  # fork, default prefix
-                     "/usr/lib/strongswan/charon",   # Arch
-                     "/usr/lib/ipsec/charon",        # Debian/Ubuntu
-                     "/usr/libexec/strongswan/charon",  # Fedora
-                     "/usr/libexec/ipsec/charon")
-CA_BUNDLE_DEFAULT = "/etc/ssl/certs/ca-certificates.crt"
+CHARON_CANDIDATES = () if WINDOWS else (
+    "/usr/local/libexec/ipsec/charon",  # fork, default prefix
+    "/usr/lib/strongswan/charon",       # Arch
+    "/usr/lib/ipsec/charon",            # Debian/Ubuntu
+    "/usr/libexec/strongswan/charon",   # Fedora
+    "/usr/libexec/ipsec/charon")
+# Windows: the system's trusted roots, see load_cas()
+CA_BUNDLE_DEFAULT = None if WINDOWS else "/etc/ssl/certs/ca-certificates.crt"
 
 CONN = "epdg"
 CHILD = "ims"
@@ -96,6 +122,12 @@ BASE_PLUGINS = ["random", "nonce", "openssl",
                 "fips-prf",  # EAP-AKA's PRF_FIPS_SHA1_160
                 "kernel-netlink", "socket-default", "vici",
                 "eap-identity", "eap-aka"]
+if WINDOWS:
+    # IP Helper for addresses and routes, Winsock for IKE, userspace ESP on
+    # a Wintun adapter. No openssl: the build has the built-in crypto only.
+    BASE_PLUGINS = [p for p in BASE_PLUGINS
+                    if p not in ("openssl", "kernel-netlink", "socket-default")]
+    BASE_PLUGINS += ["kernel-iph", "socket-win", "kernel-libipsec"]
 
 
 def log(msg: str):
@@ -121,13 +153,21 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class SimClient:
-    """Client for simcard-server/server.py (USIM-https-server API)."""
+    """Client for simcard-server/server.py (USIM-https-server API).
+    where: "unix:/path" (or a bare path) or "http://host:port"."""
 
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, where: str):
+        if re.match(r"https?://", where):
+            self.where = where.rstrip("/")
+        else:
+            self.where = "unix:" + where.removeprefix("unix:")
 
     def _get(self, query: str) -> dict:
-        conn = UnixHTTPConnection(self.path)
+        if self.where.startswith("unix:"):
+            conn = UnixHTTPConnection(self.where[len("unix:"):])
+        else:
+            conn = http.client.HTTPConnection(
+                re.sub(r"^https?://", "", self.where), timeout=5.0)
         try:
             conn.request("GET", "/?" + query)
             resp = conn.getresponse()
@@ -181,7 +221,7 @@ class HttpAkaBackend(AkaBackend):
 
     def settings(self) -> str:
         return (f"eap-aka-http {{\n"
-                f"      server = unix:{self.sim.path}\n"
+                f"      server = {self.sim.where}\n"
                 f"    }}\n")
 
 
@@ -293,6 +333,129 @@ class Tunnel:
         self._ip("link", "del", self.ifname, check=False)
 
 
+def netsh(*args, check=True) -> subprocess.CompletedProcess:
+    r = subprocess.run(["netsh", *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"netsh {' '.join(args)}: {r.stdout.strip()}")
+    return r
+
+
+def powershell(command: str, check=True) -> subprocess.CompletedProcess:
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", command], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"powershell {command}: {r.stdout.strip()}")
+    return r
+
+
+class WintunTunnel:
+    """The Wintun adapter charon's kernel-libipsec creates on Windows
+    (kernel-libipsec.tun_name) and removes again when it exits.
+
+    There are no network namespaces. The adapter gets the virtual IPs, a
+    host route to each P-CSCF and a default route with a high metric, so the
+    host's own routes stay preferred. Windows' strong host model keeps
+    traffic bound to the tunnel address (NekoIMS' SIP and RTP) on the
+    adapter's routes, i.e. in the tunnel. Inbound traffic on the adapter is
+    let through the firewall, which treats it as an unidentified (public)
+    network and would drop incoming calls.
+    """
+
+    METRIC = 9000
+    FIREWALL_RULE = "NekoIMS ePDG tunnel"
+
+    def __init__(self, ifname: str, mtu: int):
+        self.ifname, self.mtu = ifname, mtu
+        self.netns = ""
+        self.vips: list[str] = []
+        self.routes: list[tuple[str, str]] = []  # (ipv4|ipv6, prefix)
+        self.firewall = False
+
+    def create(self):
+        """Nothing to do before charon runs, it creates the adapter."""
+
+    def setup(self):
+        """Once charon (and so the adapter) is up: MTU, metric, no DAD or
+        router discovery, firewall."""
+        name = f"interface={self.ifname}"
+        # IPv4 may be unbound from the adapter (see configure()), and the
+        # adapter keeps its GUID and settings from run to run
+        netsh("interface", "ipv4", "set", "subinterface", self.ifname,
+              f"mtu={self.mtu}", "store=active", check=False)
+        netsh("interface", "ipv4", "set", "interface", name,
+              f"metric={self.METRIC}", "store=active", check=False)
+        if self.mtu >= 1280:
+            netsh("interface", "ipv6", "set", "subinterface", self.ifname,
+                  f"mtu={self.mtu}", "store=active")
+        netsh("interface", "ipv6", "set", "interface", name,
+              f"metric={self.METRIC}", "dadtransmits=0",
+              "routerdiscovery=disabled", "store=active")
+        powershell(f"Remove-NetFirewallRule -DisplayName "
+                   f"'{self.FIREWALL_RULE}' -ErrorAction SilentlyContinue",
+                   check=False)
+        powershell(f"New-NetFirewallRule -DisplayName '{self.FIREWALL_RULE}' "
+                   f"-Direction Inbound -InterfaceAlias '{self.ifname}' "
+                   f"-Action Allow | Out-Null")
+        self.firewall = True
+
+    def _route(self, fam: str, prefix: str, metric: int):
+        netsh("interface", fam, "add", "route", f"prefix={prefix}",
+              f"interface={self.ifname}", f"metric={metric}", "store=active")
+        self.routes.append((fam, prefix))
+
+    def configure(self, vips: list[str], pcscfs: list[str] = ()):
+        self.unconfigure()
+        # Without an IPv4 address from the ePDG (Verizon is IPv6-only),
+        # Windows gives the adapter a 169.254/16 one that can't be bound
+        # (WSAEADDRNOTAVAIL), so leave IPv4 off it entirely.
+        v4 = any(":" not in v for v in vips)
+        powershell(f"{'Enable' if v4 else 'Disable'}-NetAdapterBinding "
+                   f"-Name '{self.ifname}' -ComponentID ms_tcpip", check=False)
+        for vip in vips:
+            if ":" in vip:
+                netsh("interface", "ipv6", "add", "address",
+                      f"interface={self.ifname}", f"address={vip}/128",
+                      "store=active")
+                self._route("ipv6", "::/0", self.METRIC)
+            else:
+                netsh("interface", "ipv4", "add", "address",
+                      f"name={self.ifname}", f"address={vip}",
+                      "mask=255.255.255.255", "store=active")
+                self._route("ipv4", "0.0.0.0/0", self.METRIC)
+        self.vips = vips
+        fams = {":" in v for v in vips}
+        for p in pcscfs:
+            v6 = ":" in p
+            if v6 in fams:
+                self._route("ipv6" if v6 else "ipv4",
+                            f"{p}/{128 if v6 else 32}", 1)
+
+    def unconfigure(self):
+        for fam, prefix in self.routes:
+            netsh("interface", fam, "delete", "route", f"prefix={prefix}",
+                  f"interface={self.ifname}", "store=active", check=False)
+        self.routes = []
+        for vip in self.vips:
+            if ":" in vip:
+                netsh("interface", "ipv6", "delete", "address",
+                      f"interface={self.ifname}", f"address={vip}",
+                      "store=active", check=False)
+            else:
+                netsh("interface", "ipv4", "delete", "address",
+                      f"name={self.ifname}", f"address={vip}",
+                      "store=active", check=False)
+        self.vips = []
+
+    def destroy(self):
+        self.unconfigure()
+        if self.firewall:
+            powershell(f"Remove-NetFirewallRule -DisplayName "
+                       f"'{self.FIREWALL_RULE}'", check=False)
+            self.firewall = False
+
+
 # -- charon ------------------------------------------------------------------
 
 def find_charon(override: str | None) -> str:
@@ -317,20 +480,38 @@ def find_plugin_dir(charon_bin: str, override: str | None) -> str | None:
     return None
 
 
+def vici_uri(vici_socket: str) -> str:
+    if WINDOWS:
+        return f"tcp://127.0.0.1:{VICI_PORT}"
+    return f"unix://{vici_socket}"
+
+
 def strongswan_conf(vici_socket: str, plugins: list[str], aka: AkaBackend,
-                    loglevel: int) -> str:
+                    loglevel: int, ifname: str) -> str:
+    # Windows: IKEEXT holds 500/4500, so IKE uses random local ports (the
+    # ePDG's stay 500/4500); kernel-libipsec names its Wintun adapter.
+    windows = f"""\
+  port = 0
+  port_nat_t = 0
+""" if WINDOWS else ""
+    libipsec = f"""\
+    kernel-libipsec {{
+      tun_name = {ifname}
+    }}
+""" if WINDOWS else ""
     return f"""\
 charon {{
   load_modular = no
   load = {" ".join(plugins)}
-  # Addresses and routes go on the XFRM interface in the netns instead.
+  # Addresses and routes go on the tunnel interface instead (the XFRM
+  # interface in the netns, or the Wintun adapter on Windows).
   install_virtual_ip = no
   install_routes = no
-  plugins {{
+{windows}  plugins {{
     vici {{
-      socket = unix://{vici_socket}
+      socket = {vici_uri(vici_socket)}
     }}
-    p-cscf {{
+{libipsec}    p-cscf {{
       enable {{
         {CONN} = yes
       }}
@@ -347,11 +528,29 @@ charon {{
 
 
 class Charon:
-    def __init__(self, binary: str, conf: str, vici_socket: str):
+    def __init__(self, binary: str, conf: str, vici_socket: str, log=None):
         self.binary, self.conf, self.vici_socket = binary, conf, vici_socket
+        self.log = log  # file for charon's output, else ours
         self.proc = None
 
+    def _connect(self) -> socket.socket:
+        if WINDOWS:
+            return socket.create_connection(("127.0.0.1", VICI_PORT), 2)
+        sock = socket.socket(socket.AF_UNIX)
+        sock.connect(self.vici_socket)
+        return sock
+
+    def _vici_up(self) -> bool:
+        try:
+            self._connect().close()
+            return True
+        except OSError:
+            return False
+
     def start(self):
+        if WINDOWS:
+            self._start_windows()
+            return
         pid = "/run/charon.pid"
         if os.path.exists(pid):
             try:
@@ -364,7 +563,8 @@ class Charon:
         if os.path.exists(self.vici_socket):
             os.unlink(self.vici_socket)
         env = dict(os.environ, STRONGSWAN_CONF=self.conf)
-        self.proc = subprocess.Popen([self.binary], env=env)
+        self.proc = subprocess.Popen([self.binary], env=env, stdout=self.log,
+                                     stderr=self.log)
         deadline = time.monotonic() + 10
         while not os.path.exists(self.vici_socket):
             if self.proc.poll() is not None:
@@ -373,12 +573,41 @@ class Charon:
                 sys.exit("charon did not open its vici socket")
             time.sleep(0.1)
 
+    def _start_windows(self):
+        """charon-svc runs in the console when not started as a service. Its
+        own process group, so Ctrl-C reaches only us and we stop it with
+        CTRL_BREAK (a clean exit that removes the Wintun adapter)."""
+        if self._vici_up():
+            sys.exit(f"another charon answers on vici port {VICI_PORT} (the "
+                     f"strongSwan service, or a dialer left running?); stop "
+                     f"it first")
+        env = dict(os.environ, STRONGSWAN_CONF=self.conf)
+        self.proc = subprocess.Popen(
+            [self.binary], env=env, stdout=self.log, stderr=self.log,
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        deadline = time.monotonic() + 15
+        while not self._vici_up():
+            if self.proc.poll() is not None:
+                sys.exit(f"charon exited with {self.proc.returncode} (as "
+                         f"Administrator? wintun.dll next to it?)")
+            if time.monotonic() > deadline:
+                sys.exit("charon did not open its vici port")
+            time.sleep(0.2)
+
     def check(self):
         """Exit if charon died; there is nothing left to redial with."""
-        rc = self.proc.poll() if self.proc else None
+        rc = None
+        if self.proc:
+            try:  # a lost vici connection can come before charon is gone
+                rc = self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                pass
         if rc is None:
             return
-        if rc < 0:
+        if WINDOWS and rc >= 0xC0000000:  # NTSTATUS, e.g. an access violation
+            why = f"crashed with 0x{rc:08X}"
+        elif rc < 0:
             try:
                 why = f"killed by {signal.Signals(-rc).name}"
             except ValueError:
@@ -389,15 +618,18 @@ class Charon:
 
     def session(self):
         import vici
-        sock = socket.socket(socket.AF_UNIX)
-        sock.connect(self.vici_socket)
+        sock = self._connect()
+        sock.settimeout(None)
         return vici.Session(sock)
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+            if WINDOWS:
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self.proc.terminate()
             try:
-                self.proc.wait(5)
+                self.proc.wait(10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
 
@@ -407,7 +639,21 @@ class Charon:
 def remote_arch() -> str:
     """Architecture name used by the release tarballs."""
     m = platform.machine()
-    return {"aarch64": "arm64", "amd64": "x86_64"}.get(m, m)
+    if WINDOWS:
+        # The OS's, not this Python's: x64 Python runs emulated on ARM64
+        import ctypes
+        proc, native = ctypes.c_ushort(), ctypes.c_ushort()
+        k32 = ctypes.windll.kernel32
+        if k32.IsWow64Process2(k32.GetCurrentProcess(), ctypes.byref(proc),
+                               ctypes.byref(native)):
+            m = {0xAA64: "arm64", 0x8664: "x86_64"}.get(native.value, m)
+        # There is no native arm64 build: clang miscompiles struct varargs
+        # (chunk_t) on Windows arm64, see neko-strongswan's
+        # build-windows.sh. The x86_64 one runs emulated, Wintun included.
+        if m == "arm64":
+            m = "x86_64"
+    return {"aarch64": "arm64", "amd64": "x86_64",
+            "AMD64": "x86_64", "ARM64": "arm64"}.get(m, m)
 
 
 def fetch(url: str, dest: str) -> str:
@@ -445,6 +691,15 @@ def published_sha256(url: str) -> str | None:
 
 
 def extract(archive: str, dest: str):
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as z:
+            root = os.path.realpath(dest)
+            for name in z.namelist():
+                target = os.path.realpath(os.path.join(dest, name))
+                if os.path.commonpath([root, target]) != root:
+                    sys.exit(f"--remote: refusing archive member {name!r}")
+            z.extractall(dest)
+        return
     with tarfile.open(archive, "r:gz") as tar:
         if hasattr(tarfile, "data_filter"):
             tar.extractall(dest, filter="data")
@@ -466,7 +721,8 @@ def use_remote(url: str, pinned: str | None) -> str:
     work = tempfile.mkdtemp(prefix="strongswan-", dir=RUN_DIR)
     atexit.register(shutil.rmtree, work, ignore_errors=True)
 
-    archive = os.path.join(work, "strongswan.tar.gz")
+    archive = os.path.join(work, "strongswan.zip" if WINDOWS
+                           else "strongswan.tar.gz")
     log(f"fetching {url}")
     try:
         digest = fetch(url, archive)
@@ -488,13 +744,16 @@ def use_remote(url: str, pinned: str | None) -> str:
     except (tarfile.TarError, OSError) as e:
         sys.exit(f"--remote: bad archive: {e}")
     os.unlink(archive)
-    found = glob.glob(os.path.join(root, "libexec/ipsec/charon")) + \
-        glob.glob(os.path.join(root, "*/libexec/ipsec/charon"))
+    binary = "bin/charon-svc.exe" if WINDOWS else "libexec/ipsec/charon"
+    found = glob.glob(os.path.join(root, binary)) + \
+        glob.glob(os.path.join(root, "*", binary))
     if len(found) != 1:
-        sys.exit("--remote: archive has no (unique) libexec/ipsec/charon")
+        sys.exit(f"--remote: archive has no (unique) {binary}")
     charon = found[0]
-    python = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.dirname(charon))), "lib", "python")
+    pkg = os.path.dirname(os.path.dirname(charon))
+    if not WINDOWS:
+        pkg = os.path.dirname(pkg)
+    python = os.path.join(pkg, "lib", "python")
     if os.path.isdir(os.path.join(python, "vici")):
         sys.path.insert(0, python)
     return charon
@@ -502,23 +761,29 @@ def use_remote(url: str, pinned: str | None) -> str:
 
 # -- vici --------------------------------------------------------------------
 
-def load_cas(session, paths: list[str]) -> int:
-    """Trust anchors for the ePDG certificate, loaded over vici. Ones charon
+def load_cas(session, paths: list[str] | None) -> int:
+    """Trust anchors for the ePDG certificate, loaded over vici: the PEM
+    bundles in paths, or the system's trusted roots (Windows). Ones charon
     can't parse (e.g. ECDSA roots on a build without an EC plugin) are
     skipped rather than failing the whole dial."""
     from vici.exception import CommandException
-    n = skipped = 0
-    for path in paths:
+    ders = []
+    if paths is None:
+        import ssl
+        ders = ssl.create_default_context().get_ca_certs(binary_form=True)
+    for path in paths or []:
         with open(path) as f:
             pem = f.read()
-        for b64 in re.findall(r"-----BEGIN CERTIFICATE-----(.*?)"
-                              r"-----END CERTIFICATE-----", pem, re.S):
-            try:
-                session.load_cert({"type": "x509", "flag": "CA",
-                                   "data": base64.b64decode(b64)})
-                n += 1
-            except CommandException:
-                skipped += 1
+        ders += [base64.b64decode(b64) for b64 in
+                 re.findall(r"-----BEGIN CERTIFICATE-----(.*?)"
+                            r"-----END CERTIFICATE-----", pem, re.S)]
+    n = skipped = 0
+    for der in ders:
+        try:
+            session.load_cert({"type": "x509", "flag": "CA", "data": der})
+            n += 1
+        except CommandException:
+            skipped += 1
     if skipped:
         log(f"skipped {skipped} CA certificates charon could not parse")
     return n
@@ -563,6 +828,7 @@ def connection(epdg: str, identity: str, remote_id: str, remote_auth: str,
         "children": {CHILD: {
             "remote_ts": ["0.0.0.0/0", "::/0"],
             "esp_proposals": bundle.get("esp_proposals", ESP_PROPOSALS),
+            # the XFRM interface's; kernel-libipsec (Windows) ignores it
             "if_id_in": hex(IF_ID),
             "if_id_out": hex(IF_ID),
             "start_action": "none",
@@ -599,6 +865,40 @@ def local_vips(session) -> list[str]:
         if CONN in sa:
             return [s(v) for v in sa[CONN].get("local-vips", [])]
     return []
+
+
+def wait_down(events):
+    """Block until our IKE SA goes away. On Windows in a thread: Ctrl-C
+    (and --lifeline) can't interrupt a blocking recv() there."""
+    def listen():
+        for kind, msg in events.listen(["ike-updown"]):
+            if CONN in msg and s(msg.get("up", b"no")) != "yes":
+                return
+
+    if not WINDOWS:
+        listen()
+        return
+    done, err = threading.Event(), []
+
+    def run():
+        try:
+            listen()
+        except Exception as e:  # vici connection lost
+            err.append(e)
+        finally:
+            done.set()
+    threading.Thread(target=run, daemon=True).start()
+    while not done.wait(0.5):
+        pass
+    if err:
+        raise err[0]
+
+
+def is_admin() -> bool:
+    if WINDOWS:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    return os.geteuid() == 0
 
 
 def write_state(path: str, state: dict | None):
@@ -643,8 +943,9 @@ def write_pcscf(path: str, pcscfs: list[str] | None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--simcard", default=SIMCARD_SOCKET_DEFAULT,
-                    help="simcard-server Unix socket")
+    ap.add_argument("--simcard", default=SIMCARD_DEFAULT,
+                    help="simcard-server: unix:/path (or a bare path) or "
+                         f"http://host:port (default: {SIMCARD_DEFAULT})")
     ap.add_argument("--bundles", default=BUNDLES_DEFAULT)
     ap.add_argument("--epdg", default=None, help="ePDG host (default: "
                     "carrier bundle, else 3GPP discovery name)")
@@ -655,29 +956,31 @@ def main():
                     help="IDr to send (default: the APN)")
     ap.add_argument("--no-encap", action="store_true",
                     help="send raw ESP when there is no NAT instead of "
-                         "always encapsulating it in UDP 4500")
+                         "always encapsulating it in UDP 4500 (not on "
+                         "Windows)")
     ap.add_argument("--remote-auth", choices=("pubkey", "eap"), default=None,
                     help="how the ePDG authenticates (default: bundle "
                          "epdg_auth, else pubkey with a fallback to eap if "
                          "the ePDG turns out to be EAP-only)")
     ap.add_argument("--ca", action="append", default=None,
                     help=f"CA bundle(s) for the ePDG certificate "
-                         f"(default: {CA_BUNDLE_DEFAULT})")
+                         f"(default: {CA_BUNDLE_DEFAULT or 'the system store'})")
     ap.add_argument("--aka-backend", choices=sorted(AKA_BACKENDS),
                     default="http")
-    ap.add_argument("--netns", default="ims",
+    ap.add_argument("--netns", default="" if WINDOWS else "ims",
                     help='netns for the tunnel interface, "" to keep it in '
-                         "the current one (e.g. in a container)")
+                         "the current one (e.g. in a container); Linux only")
     ap.add_argument("--epdg-family", choices=("any", "4", "6"),
                     default="any",
                     help="reach the ePDG over this IP version only")
-    ap.add_argument("--ifname", default="ims0")
+    ap.add_argument("--ifname", default="NekoIMS" if WINDOWS else "ims0",
+                    help="tunnel interface (Windows: the Wintun adapter)")
     ap.add_argument("--mtu", type=int, default=1400)
     ap.add_argument("--charon", default=None, help="charon binary")
     ap.add_argument("--remote", default=None, metavar="URL",
                     help="run the static strongSwan build from this tar.gz "
-                         "(URL or path, {arch} expands to x86_64/arm64) "
-                         "instead of an installed charon")
+                         "(.zip on Windows; URL or path, {arch} expands to "
+                         "x86_64/arm64) instead of an installed charon")
     ap.add_argument("--remote-sha256", default=None, metavar="HEX",
                     help="expected sha256 of the --remote tarball (default: "
                          "the published <URL>.sha256, if any)")
@@ -687,15 +990,50 @@ def main():
                     help="charon log level (-1..4)")
     ap.add_argument("--retry", type=int, default=10,
                     help="seconds between redials, 0 to exit on failure")
+    ap.add_argument("--log", default=None, metavar="PATH",
+                    help="append our and charon's output here")
+    ap.add_argument("--lifeline", action="store_true",
+                    help="hang up and exit when stdin closes (for a parent "
+                         "process that can't signal us, e.g. start.ps1)")
     args = ap.parse_args()
 
-    if os.geteuid() != 0:
-        sys.exit("must run as root")
+    log_file = None
+    if args.log:
+        log_file = open(args.log, "a", buffering=1)
+        sys.stdout = sys.stderr = log_file
+    if args.lifeline:
+        import _thread
+
+        def lifeline():
+            # EOF once the parent is gone. os.read, not the buffered
+            # sys.stdin, whose lock would hang interpreter shutdown.
+            while os.read(sys.stdin.fileno(), 4096):
+                pass
+            log("stdin closed, hanging up")
+            _thread.interrupt_main()
+        threading.Thread(target=lifeline, daemon=True).start()
+
+    if not is_admin():
+        sys.exit("must run as Administrator" if WINDOWS else
+                 "must run as root")
+    if WINDOWS and args.netns:
+        sys.exit("--netns: there are no network namespaces on Windows")
+    if WINDOWS and args.no_encap:
+        sys.exit("--no-encap: kernel-libipsec on Windows has no raw ESP")
     if args.remote and args.charon:
         sys.exit("--remote and --charon are mutually exclusive")
     if args.remote:
         os.makedirs(RUN_DIR, mode=0o750, exist_ok=True)
         args.charon = use_remote(args.remote, args.remote_sha256)
+    elif args.charon:
+        # An unpacked release (bin/charon-svc.exe, libexec/ipsec/charon)
+        # brings its vici client in lib/python
+        d = os.path.dirname(os.path.abspath(args.charon))
+        for _ in range(3):
+            d = os.path.dirname(d)
+            if os.path.isdir(os.path.join(d, "lib", "python", "vici")):
+                sys.path.insert(0, os.path.join(d, "lib", "python"))
+                break
     try:
         import vici  # noqa: F401
     except ImportError:
@@ -744,15 +1082,22 @@ def main():
                      f"missing from {plugin_dir}")
 
     with open(conf, "w") as f:
-        f.write(strongswan_conf(vici_socket, plugins, aka, args.loglevel))
+        f.write(strongswan_conf(vici_socket, plugins, aka, args.loglevel,
+                                args.ifname))
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    tunnel = Tunnel(args.netns, args.ifname, args.mtu)
-    charon = Charon(charon_bin, conf, vici_socket)
+    if WINDOWS:
+        signal.signal(signal.SIGBREAK, lambda *_: sys.exit(0))
+        tunnel = WintunTunnel(args.ifname, args.mtu)
+    else:
+        tunnel = Tunnel(args.netns, args.ifname, args.mtu)
+    charon = Charon(charon_bin, conf, vici_socket, log_file)
     try:
         aka.start()
         tunnel.create()
         charon.start()
+        if WINDOWS:
+            tunnel.setup()
 
         cmd = charon.session()
         remote_auth = args.remote_auth or bundle.get("epdg_auth")
@@ -761,7 +1106,8 @@ def main():
         auth_guessed = remote_auth is None
         remote_auth = remote_auth or "pubkey"
         if remote_auth == "pubkey":
-            n = load_cas(cmd, args.ca or [CA_BUNDLE_DEFAULT])
+            n = load_cas(cmd, args.ca or ([CA_BUNDLE_DEFAULT]
+                                          if CA_BUNDLE_DEFAULT else None))
             log(f"loaded {n} CA certificates")
 
         def load_conn():
@@ -795,7 +1141,10 @@ def main():
             vips = local_vips(cmd)
             if bundle.get("pcscf_match_family", False):
                 pcscfs = tunnel_family_first(pcscfs, vips)
-            tunnel.configure(vips)
+            if WINDOWS:
+                tunnel.configure(vips, pcscfs)
+            else:
+                tunnel.configure(vips)
             write_state(state_path, {"netns": args.netns,
                                      "ifname": args.ifname,
                                      "vips": vips, "pcscf": pcscfs,
@@ -808,9 +1157,7 @@ def main():
 
             # Block until the IKE SA goes away, then redial.
             try:
-                for kind, msg in events.listen(["ike-updown"]):
-                    if CONN in msg and s(msg.get("up", b"no")) != "yes":
-                        break
+                wait_down(events)
             except Exception:  # vici connection lost
                 charon.check()
                 raise
@@ -838,6 +1185,8 @@ def main():
         for path in (conf, vici_socket):
             if os.path.exists(path):
                 os.unlink(path)
+        if log_file:
+            log_file.flush()
 
 
 if __name__ == "__main__":

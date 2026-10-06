@@ -1,0 +1,68 @@
+diff --git a/include/baresip.h b/include/baresip.h
+--- a/include/baresip.h
++++ b/include/baresip.h
+@@ -1008,6 +1008,7 @@ int  ua_add_custom_hdr(struct ua *ua, const struct pl *name,
+ 		       const struct pl *value);
+ int  ua_rm_custom_hdr(struct ua *ua, struct pl *name);
+ int  ua_set_resp_headers(struct ua *ua, const char *hdrs);
++int  ua_set_media_laddr(struct ua *ua, const struct sa *laddr);
+ const char *ua_resp_headers(const struct ua *ua);
+ int  ua_enable_autoanswer(struct ua *ua, int32_t adelay,
+ 		enum answer_method met);
+diff --git a/src/ua.c b/src/ua.c
+--- a/src/ua.c
++++ b/src/ua.c
+@@ -30,6 +30,7 @@ struct ua {
+ 	char *ansval;                /**< SIP auto answer value              */
+ 	struct sa dst;               /**< Current destination address        */
+ 	char *resp_hdrs;             /**< Headers for responses to INVITE    */
++	struct sa media_laddr;       /**< Fixed local address for media      */
+ };
+ 
+ struct ua_xhdr_filter {
+@@ -916,6 +917,15 @@ int ua_call_alloc(struct call **callp, struct ua *ua,
+ 		af = net_af(net);
+ 	}
+ 
++	/* A fixed media address wins over the routing lookup below, e.g. a
++	 * tunnel's address where the default route isn't the tunnel */
++	if (sa_isset(&ua->media_laddr, SA_ADDR) &&
++	    (af == AF_UNSPEC || af == sa_af(&ua->media_laddr))) {
++		sa_init(&ua->dst, AF_UNSPEC);
++		laddr = &ua->media_laddr;
++		af = sa_af(laddr);
++	}
++
+ 	if (af != AF_UNSPEC && !net_af_enabled(net, af)) {
+ 		warning("ua: address family %s not supported\n",
+ 				net_af2name(af));
+@@ -1967,6 +1977,29 @@ const char *ua_resp_headers(const struct ua *ua)
+ }
+ 
+ 
++/**
++ * Use a fixed local address for the media of this UA's calls, instead of
++ * the one routed toward the peer. NULL goes back to routing.
++ *
++ * @param ua    User-Agent
++ * @param laddr Local address, or NULL
++ *
++ * @return 0 if success, otherwise errorcode
++ */
++int ua_set_media_laddr(struct ua *ua, const struct sa *laddr)
++{
++	if (!ua)
++		return EINVAL;
++
++	if (laddr)
++		sa_cpy(&ua->media_laddr, laddr);
++	else
++		sa_init(&ua->media_laddr, AF_UNSPEC);
++
++	return 0;
++}
++
++
+ const char *ua_cuser(const struct ua *ua)
+ {
+ 	if (!ua)

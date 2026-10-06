@@ -1,0 +1,97 @@
+diff --git a/include/baresip.h b/include/baresip.h
+--- a/include/baresip.h
++++ b/include/baresip.h
+@@ -1009,6 +1009,7 @@ int  ua_add_custom_hdr(struct ua *ua, const struct pl *name,
+ int  ua_rm_custom_hdr(struct ua *ua, struct pl *name);
+ int  ua_set_resp_headers(struct ua *ua, const char *hdrs);
+ int  ua_set_media_laddr(struct ua *ua, const struct sa *laddr);
++const struct sa *ua_media_laddr(const struct ua *ua);
+ const char *ua_resp_headers(const struct ua *ua);
+ int  ua_enable_autoanswer(struct ua *ua, int32_t adelay,
+ 		enum answer_method met);
+@@ -1539,6 +1540,7 @@ struct stream_param {
+ 	int af;             /**< Wanted address family */
+ 	const char *cname;  /**< Canonical name        */
+ 	const char *peer;   /**< Peer uri/name or identifier  */
++	const struct sa *laddr; /**< Address to bind RTP to, NULL for any */
+ };
+ 
+ struct jbuf_stat;
+diff --git a/src/call.c b/src/call.c
+--- a/src/call.c
++++ b/src/call.c
+@@ -750,6 +750,7 @@ int call_streams_alloc(struct call *call)
+ 	strm_prm.cname	  = call->local_uri;
+ 	strm_prm.peer	  = call->peer_uri;
+ 	strm_prm.rtcp_mux = call->acc->rtcp_mux;
++	strm_prm.laddr    = ua_media_laddr(call->ua);
+ 
+ 	/* Audio stream */
+ 	err = audio_alloc(&call->audio, &call->streaml, &strm_prm,
+diff --git a/src/stream.c b/src/stream.c
+--- a/src/stream.c
++++ b/src/stream.c
+@@ -362,7 +362,8 @@ void stream_process_rtcp(struct stream *strm, struct rtcp_msg *msg)
+ }
+ 
+ 
+-static int stream_sock_alloc(struct stream *s, int af)
++static int stream_sock_alloc(struct stream *s, int af,
++			     const struct sa *bind)
+ {
+ 	struct sa laddr;
+ 	uint8_t tos;
+@@ -371,8 +372,16 @@ static int stream_sock_alloc(struct stream *s, int af)
+ 	if (!s)
+ 		return EINVAL;
+ 
+-	/* we listen on all interfaces */
+-	sa_init(&laddr, af);
++	/* we listen on all interfaces, unless the UA has a fixed media
++	 * address: then that one, so the source address (and with it the
++	 * route) is the one in our SDP */
++	if (bind && sa_af(bind) == af) {
++		sa_cpy(&laddr, bind);
++		sa_set_port(&laddr, 0);
++	}
++	else {
++		sa_init(&laddr, af);
++	}
+ 
+ 	err = rtp_listen(&s->rtp, IPPROTO_UDP, &laddr,
+ 			 s->cfg.rtp_ports.min, s->cfg.rtp_ports.max,
+@@ -584,7 +593,7 @@ int stream_alloc(struct stream **sp, struct list *streaml,
+ 
+ 		tmr_init(&s->rxm.tmr_rtp);
+ 		tmr_init(&s->rxm.tmr_rec);
+-		err = stream_sock_alloc(s, prm->af);
++		err = stream_sock_alloc(s, prm->af, prm->laddr);
+ 		if (err) {
+ 			warning("stream: failed to create socket"
+ 				" for media '%s' (%m)\n",
+diff --git a/src/ua.c b/src/ua.c
+--- a/src/ua.c
++++ b/src/ua.c
+@@ -2000,6 +2000,22 @@ int ua_set_media_laddr(struct ua *ua, const struct sa *laddr)
+ }
+ 
+ 
++/**
++ * Get the fixed local address for the media of this UA's calls
++ *
++ * @param ua User-Agent
++ *
++ * @return The address, NULL if media follows routing
++ */
++const struct sa *ua_media_laddr(const struct ua *ua)
++{
++	if (!ua || !sa_isset(&ua->media_laddr, SA_ADDR))
++		return NULL;
++
++	return &ua->media_laddr;
++}
++
++
+ const char *ua_cuser(const struct ua *ua)
+ {
+ 	if (!ua)

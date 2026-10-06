@@ -47,7 +47,10 @@ MM_SIM = "org.freedesktop.ModemManager1.Sim"
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUNDLES_DEFAULT = os.path.join(REPO, "carrier-bundles")
-SIMCARD_SERVER_DEFAULT = "unix:/run/nekoims/simcard.sock"
+# Loopback TCP where Python has no AF_UNIX (Windows), see simcard-server.
+SIMCARD_SERVER_DEFAULT = ("unix:/run/nekoims/simcard.sock"
+                          if hasattr(socket, "AF_UNIX")
+                          else "http://127.0.0.1:8888")
 
 # Bundle keys copied into nekoims.json as-is.
 CONFIG_KEYS = ("domain", "transport", "pcscf_port", "p_access_network_info",

@@ -30,6 +30,9 @@ without a loopback interface or veth pair.
 
     sudo python3 server.py                               # /run/nekoims/simcard.sock
     sudo python3 server.py --listen 127.0.0.1:8888       # TCP instead
+
+On Windows (no AF_UNIX in Python there) it listens on TCP 127.0.0.1:8888 by
+default, which is what NekoIMS and the dialer expect there.
     curl --unix-socket /run/nekoims/simcard.sock 'http://sim/?type=imsi'
 
 Requires pyscard and a running pcscd.
@@ -52,6 +55,8 @@ USIM_AID_PREFIX = bytes.fromhex("A0000000871002")
 ISIM_AID_PREFIX = bytes.fromhex("A0000000871004")
 
 DEFAULT_UNIX_SOCKET = "/run/nekoims/simcard.sock"
+DEFAULT_TCP = "127.0.0.1:8888"  # where there is no AF_UNIX (Windows)
+HAVE_UNIX = hasattr(socket, "AF_UNIX")
 
 
 class CardError(Exception):
@@ -240,15 +245,18 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(503, {"error": f"{type(e).__name__}: {e}"})
 
 
-class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn,
-                              socketserver.UnixStreamServer):
-    daemon_threads = True
+if HAVE_UNIX:
+    class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn,
+                                  socketserver.UnixStreamServer):
+        daemon_threads = True
 
 
 class ThreadingTCPHTTPServer(socketserver.ThreadingMixIn,
                              socketserver.TCPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # SO_REUSEADDR on Windows lets another process bind the same port, so a
+    # second server would take requests meant for this one.
+    allow_reuse_address = sys.platform != "win32"
 
 
 def unix_socket_in_use(path: str) -> bool:
@@ -289,8 +297,9 @@ def main():
     ap.add_argument("--reader", type=int, default=0, help="PC/SC reader index")
     ap.add_argument("--unix", default=DEFAULT_UNIX_SOCKET,
                     help=f"Unix socket path (default: {DEFAULT_UNIX_SOCKET})")
-    ap.add_argument("--listen", default=None,
-                    help="listen on TCP HOST:PORT instead of the Unix socket")
+    ap.add_argument("--listen", default=None if HAVE_UNIX else DEFAULT_TCP,
+                    help="listen on TCP HOST:PORT instead of the Unix socket"
+                         + ("" if HAVE_UNIX else f" (default: {DEFAULT_TCP})"))
     args = ap.parse_args()
     if not args.listen and unix_socket_in_use(args.unix):
         sys.exit(f"another SIM server is already serving {args.unix}")

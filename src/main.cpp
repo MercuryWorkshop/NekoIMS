@@ -29,10 +29,6 @@
 
 namespace {
 
-const char* const kDefaultConfigPath = "/etc/nekoims/config.json";
-const char* const kDefaultSimcardServer = "unix:/run/nekoims/simcard.sock";
-// Written by the ePDG dialer while its tunnel is up, one P-CSCF per line.
-const char* const kPcscfFile = "/run/nekoims/pcscf";
 const char* const kMmtelIcsi = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 const int kAsyncWorkers = 4;
 
@@ -86,12 +82,13 @@ void usage(const char* argv0) {
                  "  -v         Verbose/debug logging\n"
                  "  -t         SIP trace\n"
                  "  -h         Show this help\n",
-                 NEKOIMS_VERSION, argv0, kDefaultConfigPath, kPcscfFile);
+                 NEKOIMS_VERSION, argv0, default_config_path().c_str(),
+                 pcscf_file().c_str());
 }
 
 // First address in the dialer's P-CSCF file, skipping blank and # lines.
-bool read_pcscf_file(const char* path, std::string& out) {
-    std::ifstream in(path);
+bool read_pcscf_file(const std::string& path, std::string& out) {
+    std::ifstream in(path.c_str());
     std::string line;
     while (std::getline(in, line)) {
         const size_t b = line.find_first_not_of(" \t\r");
@@ -219,6 +216,12 @@ bool load_settings(const std::string& path, Settings& out) {
             c.audio_codecs = b.value("audio_codecs", c.audio_codecs);
             c.listen = b.value("listen", c.listen);
             c.netns = b.value("netns", c.netns);
+            if (!c.netns.empty() && kPlatform != Platform::Linux) {
+                std::fprintf(stderr, "nekoims: %s: b2bua.netns is Linux "
+                             "only, set b2bua.listen to the address the "
+                             "external UA reaches\n", path.c_str());
+                return false;
+            }
             if (!c.netns.empty() && c.listen.empty()) {
                 std::fprintf(stderr, "nekoims: %s: b2bua.netns needs "
                              "b2bua.listen\n", path.c_str());
@@ -228,6 +231,14 @@ bool load_settings(const std::string& path, Settings& out) {
     } catch (const nlohmann::json::exception& e) {
         std::fprintf(stderr, "nekoims: bad config '%s': %s\n", path.c_str(),
                      e.what());
+        return false;
+    }
+
+    // ipsec_windows.cpp has no SAs to install, so REGISTER could only fail
+    if (out.sec_agree && kPlatform == Platform::Windows) {
+        std::fprintf(stderr, "nekoims: %s: sec_agree (IMS IPsec, needed by "
+                     "this carrier) is only implemented on Linux\n",
+                     path.c_str());
         return false;
     }
 
@@ -470,7 +481,8 @@ void signal_handler(int sig) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    std::string config_path = kDefaultConfigPath;
+    std::string config_path = default_config_path();
+    const std::string pcscf_path = pcscf_file();
     bool verbose = false;
     bool trace = false;
     std::string pcscf;
@@ -506,14 +518,14 @@ int main(int argc, char* argv[]) {
     if (!load_settings(config_path, settings)) return EXIT_FAILURE;
     if (!pcscf.empty()) settings.pcscf = pcscf;
     if (settings.pcscf.empty() &&
-        read_pcscf_file(kPcscfFile, settings.pcscf))
+        read_pcscf_file(pcscf_path, settings.pcscf))
         std::fprintf(stderr, "nekoims: using P-CSCF %s from %s\n",
-                     settings.pcscf.c_str(), kPcscfFile);
+                     settings.pcscf.c_str(), pcscf_path.c_str());
     if (settings.pcscf.empty()) {
         std::fprintf(stderr,
                      "nekoims: no P-CSCF, pass -p <addr>, set \"pcscf\" in "
                      "%s or bring up the ePDG dialer (%s)\n",
-                     config_path.c_str(), kPcscfFile);
+                     config_path.c_str(), pcscf_path.c_str());
         return EXIT_FAILURE;
     }
 
@@ -608,6 +620,19 @@ int main(int argc, char* argv[]) {
     if (err) {
         warning("nekoims: baresip init failed: %m\n", err);
         goto out;
+    }
+
+    // Fix for windows including Link Local IPv4 addresses on 
+    // any adapter without an IPv4. You can't bind to these 
+    // addresses (it seems) so BareSIP will crash when trying to. 
+    {
+        std::vector<Laddr> all;
+        net_laddr_apply(baresip_network(), collect_laddr, &all);
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (sa_af(&all[i].sa) == AF_INET &&
+                (sa_in(&all[i].sa) >> 16) == 0xa9fe)
+                net_rm_address(baresip_network(), &all[i].sa);
+        }
     }
 
     // b2bua.listen: ua_init() below opens SIP sockets on each of baresip's
@@ -756,6 +781,20 @@ int main(int argc, char* argv[]) {
         goto out;
     }
     g_ims_ua = ua;
+
+    // BareSIP by default will set the SDP to state the default route's address
+    // This is not okay since the PCSCF route (through the ePDG ) is
+    // not the default route. Since Windows doesn't support network 
+    // namespaces, we have to patch BareSIP to state the known VPN
+    // address instead of the default route.
+    {
+        struct sa pcscf, media;
+        if (!sa_set_str(&pcscf, settings.pcscf.c_str(), settings.pcscf_port) &&
+            !net_dst_source_addr_get(&pcscf, &media)) {
+            ua_set_media_laddr(ua, &media);
+            info("nekoims: IMS media on %j\n", &media);
+        }
+    }
 
     // IMS headers for requests baresip sends (INVITE etc.), TS 24.229 5.1.2A
     {
