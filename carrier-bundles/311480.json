@@ -6,6 +6,7 @@
   "aka_app": "usim",
   "epdg": "wo.vzwwo.com",
   "apn": "ims",
+  "apn_data": "vzwinternet",
   "epdg_auth": "eap",
   "transport": "udp",
   "p_access_network_info": "IEEE-802.11;country=US;i-wlan-node-id=ffffffffffff",

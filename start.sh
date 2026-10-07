@@ -3,7 +3,8 @@
 #
 # start.sh: build NekoIMS if needed, start the SIM server for whatever SIM is
 # attached (PC/SC reader or ModemManager modem), write the config, dial the
-# ePDG with the static strongSwan build and run NekoIMS in the tunnel netns.
+# ePDG with the static strongSwan build (or, with --qmi-ims, the IMS PDN over
+# LTE) and run NekoIMS in the tunnel netns.
 #
 #   ./start.sh [options] [-- nekoims args...]
 #
@@ -11,6 +12,13 @@
 #                     SIM backend (default: autodetect, PC/SC reader first,
 #                     else a SIM server already on the socket, e.g. a
 #                     serial_server.py started by hand)
+#   --qmi-ims         use IMS over LTE instead of the ePDG:
+#                     tools/qmi_netdev.py brings up the IMS and internet
+#                     PDNs on the QMI modem (Sierra EM7455) and serves its
+#                     SIM over the AT port
+#   --apn APN         IMS APN for --qmi-ims (default: the carrier bundle's)
+#   --apn_data APN    internet APN for --qmi-ims (default: the carrier
+#                     bundle's)
 #   --reader N        PC/SC reader index (pcsc)
 #   --modem M         ModemManager modem index, path or IMEI (mm)
 #   --config PATH     NekoIMS config (default: generated from the SIM by
@@ -35,8 +43,10 @@ PCSCF_FILE=$RUN_DIR/pcscf
 NETNS=ims
 REMOTE_DEFAULT='https://github.com/MercuryWorkshop/neko-strongswan/releases/latest/download/linux-strongswan-{arch}.tar.gz'
 DIAL_TIMEOUT=90
+QMI_TIMEOUT=180  # includes the modem's reboot when its USB layout changes
 
 SIM=auto READER= MODEM= CONFIG= REMOTE= CHARON= REBUILD=0 WATCH=0
+QMI=0 APN= APN_DATA=
 NEKOIMS_ARGS=()
 SUDO_ARGS=()  # our arguments minus --rebuild, for the re-run under sudo
 for a in "$@"; do [ "$a" = --rebuild ] || SUDO_ARGS+=("$a"); done
@@ -47,6 +57,9 @@ log() { echo "start.sh: $*" >&2; }
 while [ $# -gt 0 ]; do
 	case $1 in
 		--sim)		SIM=${2:?}; shift ;;
+		--qmi-ims)	QMI=1 ;;
+		--apn)		APN=${2:?}; shift ;;
+		--apn_data|--apn-data)	APN_DATA=${2:?}; shift ;;
 		--reader)	READER=${2:?}; shift ;;
 		--modem)	MODEM=${2:?}; shift ;;
 		--config)	CONFIG=${2:?}; shift ;;
@@ -55,13 +68,20 @@ while [ $# -gt 0 ]; do
 		--rebuild)	REBUILD=1 ;;
 		--watch)	WATCH=1 ;;
 		--)			shift; NEKOIMS_ARGS=("$@"); break ;;
-		-h|--help)	sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help)	sed -n '4,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*)			die "unknown option $1 (see --help)" ;;
 	esac
 	shift
 done
 case $SIM in auto|pcsc|mm|server) ;; *) die "--sim must be pcsc, mm or server" ;; esac
 [ -n "$REMOTE" ] && [ -n "$CHARON" ] && die "--remote and --charon are exclusive"
+if [ "$QMI" = 1 ]; then
+	case $SIM in auto|server) ;; *) die "--qmi-ims uses the modem's SIM, drop --sim" ;; esac
+elif [ -n "$APN$APN_DATA" ]; then
+	die "--apn and --apn_data need --qmi-ims"
+fi
+DIAL_WHAT="the ePDG tunnel"
+[ "$QMI" = 0 ] || DIAL_WHAT="the LTE bearer"
 
 # -- 1. build (as the invoking user, never as root) ---------------------------
 
@@ -91,7 +111,7 @@ cleanup() {
 	trap - EXIT INT TERM
 	[ -z "$TAIL_PID" ] || kill "$TAIL_PID" 2>/dev/null || true
 	if [ -n "$DIAL_PID" ] && kill -0 "$DIAL_PID" 2>/dev/null; then
-		log "hanging up the ePDG tunnel"
+		log "hanging up $DIAL_WHAT"
 		kill -TERM "$DIAL_PID" 2>/dev/null || true
 		wait "$DIAL_PID" 2>/dev/null || true
 	fi
@@ -113,7 +133,7 @@ flock -n 9 || die "another start.sh is already running"
 # Processes a previous run left behind (e.g. its terminal was killed). A second
 # dialer would fight over charon, a second SIM server over the card.
 leftovers() { pgrep -f "$REPO/$1" | tr '\n' ' ' || true; }
-DIALERS=$(leftovers 'dialers/strongswan-dialer\.py')
+DIALERS=$(leftovers '(dialers/strongswan-dialer|tools/qmi_netdev)\.py')
 [ -z "$DIALERS" ] || die "a dialer is already running (pid $DIALERS), stop it: sudo kill $DIALERS"
 
 # -- 2. SIM server ------------------------------------------------------------
@@ -158,6 +178,42 @@ have_mm() {
 	done
 	return 1
 }
+
+# --qmi-ims: qmi_netdev dials the PDNs on the modem, then hands the modem's AT
+# port to serial_server.py, so it starts before (and is) the SIM server.
+if [ "$QMI" = 1 ]; then
+	AT_PORT=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1])
+import qmi_netdev as q; print(q.at_port(q.find_modem()))' "$REPO/tools" 2>/dev/null) ||
+		die "no QMI modem with an AT port found"
+	if pgrep -x ModemManager >/dev/null &&
+		! udevadm info -q property -n "$AT_PORT" 2>/dev/null | grep -qx 'ID_MM_PORT_IGNORE=1'; then
+		die "ModemManager is running and uses the modem's AT port $AT_PORT, \
+which the SIM server needs. Stop it (sudo systemctl stop ModemManager), or \
+keep it (and the signal strength it reports) but make it leave that port \
+alone"
+	fi
+	sim_up && die "a SIM server is already answering on $SOCK, stop it first"
+	DIAL_LOG=$RUN_DIR/qmi_netdev.log
+	rm -f "$PCSCF_FILE"
+	log "bringing up the LTE IMS bearer (log: $DIAL_LOG)"
+	python3 "$REPO/tools/qmi_netdev.py" --netns "$NETNS" ${APN:+--apn "$APN"} \
+		${APN_DATA:+--apn-data "$APN_DATA"} >"$DIAL_LOG" 2>&1 9>&- &
+	DIAL_PID=$!
+	for _ in $(seq $((QMI_TIMEOUT * 5))); do
+		[ -s "$PCSCF_FILE" ] && sim_up && break
+		if ! kill -0 "$DIAL_PID" 2>/dev/null; then
+			tail -n 25 "$DIAL_LOG" >&2
+			die "qmi_netdev exited before the bearer came up"
+		fi
+		sleep 0.2
+	done
+	if [ ! -s "$PCSCF_FILE" ] || ! sim_up; then
+		tail -n 25 "$DIAL_LOG" >&2
+		die "no P-CSCF and SIM server from qmi_netdev after ${QMI_TIMEOUT}s"
+	fi
+	grep -E '^(internet|ims): ' "$DIAL_LOG" >&2 || true
+	SIM=server
+fi
 
 if [ "$SIM" = auto ]; then
 	if have_pcsc; then
@@ -216,36 +272,38 @@ fi
 [ -f "$CONFIG" ] || die "config $CONFIG not found"
 if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("pcscf") else 1)' \
 	"$CONFIG" 2>/dev/null; then
-	log "warning: $CONFIG sets \"pcscf\", which overrides the one the ePDG assigns"
+	log "warning: $CONFIG sets \"pcscf\", which overrides the one $DIAL_WHAT assigns"
 fi
 
 # -- 4. dial ------------------------------------------------------------------
 
-DIAL_ARGS=("${DIALER_HINTS[@]}")
-if [ -n "$CHARON" ]; then
-	DIAL_ARGS+=(--charon "$CHARON")
-else
-	DIAL_ARGS+=(--remote "${REMOTE:-$REMOTE_DEFAULT}")
-fi
-DIAL_LOG=$RUN_DIR/dialer.log
-rm -f "$PCSCF_FILE"
-log "dialing the ePDG (log: $DIAL_LOG)"
-python3 "$REPO/dialers/strongswan-dialer.py" "${DIAL_ARGS[@]}" >"$DIAL_LOG" 2>&1 9>&- &
-DIAL_PID=$!
-
-for _ in $(seq $((DIAL_TIMEOUT * 5))); do
-	[ -s "$PCSCF_FILE" ] && break
-	if ! kill -0 "$DIAL_PID" 2>/dev/null; then
-		tail -n 25 "$DIAL_LOG" >&2
-		die "dialer exited before the tunnel came up"
+if [ "$QMI" = 0 ]; then
+	DIAL_ARGS=("${DIALER_HINTS[@]}")
+	if [ -n "$CHARON" ]; then
+		DIAL_ARGS+=(--charon "$CHARON")
+	else
+		DIAL_ARGS+=(--remote "${REMOTE:-$REMOTE_DEFAULT}")
 	fi
-	sleep 0.2
-done
-if [ ! -s "$PCSCF_FILE" ]; then
-	tail -n 25 "$DIAL_LOG" >&2
-	die "no P-CSCF from the ePDG after ${DIAL_TIMEOUT}s"
+	DIAL_LOG=$RUN_DIR/dialer.log
+	rm -f "$PCSCF_FILE"
+	log "dialing the ePDG (log: $DIAL_LOG)"
+	python3 "$REPO/dialers/strongswan-dialer.py" "${DIAL_ARGS[@]}" >"$DIAL_LOG" 2>&1 9>&- &
+	DIAL_PID=$!
+
+	for _ in $(seq $((DIAL_TIMEOUT * 5))); do
+		[ -s "$PCSCF_FILE" ] && break
+		if ! kill -0 "$DIAL_PID" 2>/dev/null; then
+			tail -n 25 "$DIAL_LOG" >&2
+			die "dialer exited before the tunnel came up"
+		fi
+		sleep 0.2
+	done
+	if [ ! -s "$PCSCF_FILE" ]; then
+		tail -n 25 "$DIAL_LOG" >&2
+		die "no P-CSCF from the ePDG after ${DIAL_TIMEOUT}s"
+	fi
+	grep -E '^tunnel up' "$DIAL_LOG" >&2 || true
 fi
-grep -E '^tunnel up' "$DIAL_LOG" >&2 || true
 log "P-CSCF: $(head -n1 "$PCSCF_FILE")"
 
 # -- 5. NekoIMS ---------------------------------------------------------------
@@ -323,7 +381,7 @@ while :; do
 	rm -f "$REASON_FILE"
 	case $REASON in
 		build)	MSG="build/nekoims changed" ;;
-		tunnel)	MSG="the ePDG tunnel changed" ;;
+		tunnel)	MSG="$DIAL_WHAT changed" ;;
 		*)	exit "$RC" ;;
 	esac
 	log "$MSG, restarting NekoIMS"
