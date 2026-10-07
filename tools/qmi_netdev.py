@@ -77,6 +77,7 @@ AT_TIMEOUT = 10
 QMI_TIMEOUT = 10
 DIAL_TIMEOUT = 60        # WDS Start Network waits for the PDN to come up
 REBOOT_TIMEOUT = 90      # seconds for the modem to come back after AT!RESET
+RX_MTU = 1500            # link MTU, see Link.configure
 POLL = 10                # seconds between session checks
 RETRY_MIN, RETRY_MAX = 5, 60  # seconds before reconnecting, doubling
 SIM_SERVER_TIMEOUT = 60
@@ -474,17 +475,27 @@ class Link:
         if netns:
             ip("link", "set", self.netdev, "netns", netns)
         pre = ("-n", netns) if netns else ()
-        if self.mtu:
-            ip(*pre, "link", "set", self.netdev, "mtu", str(self.mtu))
+        # qmi_wwan sizes its RX URBs from the link MTU and drops (as overruns)
+        # anything larger the modem hands up, e.g. a Verizon-to-Verizon 183
+        # over the 1428 QMI reports. Keep the link at RX_MTU and put the PDN's
+        # MTU on the routes instead, so what we send still fits.
+        ip(*pre, "link", "set", self.netdev, "mtu",
+           str(max(RX_MTU, self.mtu or 0)))
+        mtu = ("mtu", str(self.mtu)) if self.mtu else ()
+        prefixes = []
         if self.v4:
-            ip(*pre, "addr", "add", self.v4, "dev", self.netdev)
+            ip(*pre, "addr", "add", self.v4, "dev", self.netdev,
+               "noprefixroute")
+            prefixes.append(str(ipaddress.ip_interface(self.v4).network))
         if self.v6:
             ip(*pre, "-6", "addr", "add", self.v6, "dev", self.netdev,
-               "nodad")
+               "nodad", "noprefixroute")
+            prefixes.append(str(ipaddress.ip_interface(self.v6).network))
         ip(*pre, "link", "set", self.netdev, "up")
-        for r in routes:
+        for r in prefixes + routes:
             fam = "-6" if ":" in r.split()[0] else "-4"
-            ip(*pre, fam, "route", "replace", *r.split(), "dev", self.netdev)
+            ip(*pre, fam, "route", "replace", *r.split(), "dev", self.netdev,
+               *mtu)
 
     def check(self):
         for s in self.sessions:
