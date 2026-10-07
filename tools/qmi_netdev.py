@@ -28,15 +28,18 @@ default routes when it is moved into --netns. The P-CSCFs go to
 
 Once the PDNs are up the AT port is no longer needed here, so it is handed to
 simcard-server/serial_server.py, which serves the modem's SIM on
-/run/nekoims/simcard.sock for nekoims (--no-sim-server to skip).
+/run/nekoims/simcard.sock for nekoims (--no-sim-server to skip), along with
+the modem's own number from QMI for mkconfig.
 
 The sessions last as long as the script runs: Ctrl-C stops them and removes
-the addresses again. It exits if the network drops a PDN.
+the addresses again. When the modem goes away (suspend/resume) or the network
+drops a PDN, everything is torn down, the pcscf file removed, and it is all
+brought up again once the modem is back.
 
 QMI goes through qmi-proxy, so it coexists with ModemManager, but nothing
 else (NetworkManager) should connect the modem at the same time. The SIM
 server needs the AT port to itself: stop ModemManager, or keep it (and the
-signal strength it reports) with tools/udev/78-nekoims-mm-ignore-at.rules. Needs root,
+signal strength it reports) but make it leave that port alone. Needs root,
 iproute2, pyserial and libqmi's GObject bindings.
 """
 from __future__ import annotations
@@ -50,6 +53,7 @@ import re
 import signal
 import subprocess
 import sys
+import termios
 import time
 
 import gi
@@ -62,6 +66,8 @@ gi.require_version("Qmi", "1.0")
 from gi.repository import Gio, GLib, Qmi  # noqa: E402
 
 RUN_DIR = "/run/nekoims"
+PCSCF_PATH = os.path.join(RUN_DIR, "pcscf")
+SIM_SOCKET = os.path.join(RUN_DIR, "simcard.sock")  # serial_server's default
 SIM_SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                           "simcard-server", "serial_server.py")
 AT_INTERFACE = 3         # Sierra 9x30 layout: 0 diag, 2 nmea, 3 modem
@@ -72,12 +78,19 @@ QMI_TIMEOUT = 10
 DIAL_TIMEOUT = 60        # WDS Start Network waits for the PDN to come up
 REBOOT_TIMEOUT = 90      # seconds for the modem to come back after AT!RESET
 POLL = 10                # seconds between session checks
+RETRY_MIN, RETRY_MAX = 5, 60  # seconds before reconnecting, doubling
+SIM_SERVER_TIMEOUT = 60
 
 FINAL_ERROR = re.compile(r"^(ERROR|\+CME ERROR|\+CMS ERROR)", re.I)
 
 
 class Error(Exception):
     pass
+
+
+# pyserial raises termios.error (not OSError) once the tty is gone
+RETRY_ERRORS = (OSError, serial.SerialException, termios.error, Error,
+                GLib.Error)
 
 
 def log(msg: str):
@@ -495,6 +508,35 @@ class Link:
             pass
 
 
+def dms_msisdn(dev) -> str | None:
+    """The modem's own number (QMI DMS Get MSISDN). Verizon modules keep the
+    MDN in NV, so this can work where the SIM's EF.MSISDN is empty."""
+    try:
+        dms = wait(lambda cb: dev.allocate_client(
+                       Qmi.Service.DMS, 0, QMI_TIMEOUT, None, cb, None),
+                   dev.allocate_client_finish)
+    except GLib.Error as e:
+        log(f"QMI DMS: {e.message}")
+        return None
+    try:
+        out = wait(lambda cb: dms.get_msisdn(None, QMI_TIMEOUT, None, cb,
+                                             None),
+                   dms.get_msisdn_finish)
+        out.get_result()
+        return re.sub(r"[^\d+]", "", out.get_msisdn()) or None
+    except GLib.Error as e:
+        log(f"QMI DMS Get MSISDN: {e.message}")
+        return None
+    finally:
+        try:
+            wait(lambda cb: dev.release_client(
+                     dms, Qmi.DeviceReleaseClientFlags.RELEASE_CID,
+                     QMI_TIMEOUT, None, cb, None),
+                 dev.release_client_finish)
+        except GLib.Error:
+            pass
+
+
 def default_routes(link: Link, metric: int | None) -> list[str]:
     extra = f" metric {metric}" if metric is not None else ""
     return [r + extra for r, a in (("default", link.v4), ("::/0", link.v6))
@@ -507,6 +549,140 @@ def write_pcscf(path: str, pcscfs: list[str]):
     with open(tmp, "w") as f:
         f.write("".join(p + "\n" for p in pcscfs))
     os.replace(tmp, path)
+
+
+class Bearer:
+    """Both PDNs, the routes, the pcscf file and the SIM server, brought up
+    and torn down as one."""
+
+    def __init__(self, args):
+        self.args = args
+        self.links: list[Link] = []
+        self.sim_server = None
+        self.made_netns = False
+
+    def up(self):
+        args = self.args
+        usbdev = ensure_usbcomp(wait_for_modem())
+        port = AtPort(at_port(usbdev))
+        try:
+            if args.apn is None or args.apn_data is None:
+                m = re.search(r"\d{6,15}", " ".join(port.command("AT+CIMI")))
+                if not m:
+                    raise Error("AT+CIMI: no IMSI in the response")
+                imsi = m.group(0)
+                bundle, name = find_bundle(imsi, BUNDLES_DEFAULT)
+                log(f"IMSI {imsi}: carrier bundle {name or 'none'}")
+                bundle = bundle or {}
+                if args.apn is None:
+                    args.apn = bundle.get("apn", "ims")
+                if args.apn_data is None:
+                    args.apn_data = bundle.get("apn_data", "")
+            if args.apn_data:
+                port.command(f'AT+CGDCONT=1,"IPV4V6","{args.apn_data}"')
+            port.command(f'AT+CGDCONT=2,"IPV4V6","{args.apn}"')
+        finally:
+            port.close()
+
+        pairs = qmi_links(usbdev)
+        if len(pairs) < 2:
+            raise Error(f"expected two QMI interfaces, found {len(pairs)}")
+        for (netdev, wdm), cid in zip(pairs, (1, 2)):
+            self.links.append(Link(netdev, wdm, cid))
+            if cid == 2:
+                self.links[-1].mark_ims_profile()
+            self.links[-1].up()
+        inet, ims = self.links
+
+        pcscfs = ims.pcscfs + [p for p in at_pcscfs(usbdev, 2)
+                               if p not in ims.pcscfs]
+
+        inet.configure([] if args.no_default_route
+                       else default_routes(inet, args.metric), None)
+        if args.netns:
+            if args.netns not in subprocess.run(
+                    ["ip", "netns", "list"], capture_output=True,
+                    text=True).stdout.split():
+                ip("netns", "add", args.netns)
+                self.made_netns = True
+            ims.configure(default_routes(ims, None), args.netns)
+        else:
+            ims.configure([p for p in pcscfs
+                           if (":" in p and ims.v6) or
+                           (":" not in p and ims.v4)], None)
+
+        print(f"internet: {inet.netdev} "
+              f"{' '.join(filter(None, (inet.v4, inet.v6)))}")
+        print(f"ims:      {ims.netdev} "
+              f"{' '.join(filter(None, (ims.v4, ims.v6)))}"
+              + (f" (netns {args.netns})" if args.netns else ""))
+        print(f"p-cscf:   {' '.join(pcscfs) or 'none found'}", flush=True)
+
+        # The SIM server first: nekoims starts as soon as the pcscf file
+        # appears, and needs the SIM right away.
+        if not args.no_sim_server:
+            self.start_sim_server(at_port(usbdev), dms_msisdn(inet.dev))
+        if pcscfs:
+            write_pcscf(PCSCF_PATH, pcscfs)
+
+    def start_sim_server(self, port: str, msisdn: str | None):
+        self.sim_server = subprocess.Popen(
+            [sys.executable, SIM_SERVER, "--port", port]
+            + (["--msisdn", msisdn] if msisdn else []))
+        deadline = time.monotonic() + SIM_SERVER_TIMEOUT
+        while not os.path.exists(SIM_SOCKET):
+            if self.sim_server.poll() is not None:
+                raise Error(f"serial_server.py exited "
+                            f"({self.sim_server.returncode})")
+            if time.monotonic() > deadline:
+                raise Error(f"serial_server.py did not listen on "
+                            f"{SIM_SOCKET} within {SIM_SERVER_TIMEOUT}s")
+            time.sleep(0.2)
+
+    def check(self):
+        for link in self.links:
+            link.check()
+        if self.sim_server and self.sim_server.poll() is not None:
+            raise Error(f"serial_server.py exited "
+                        f"({self.sim_server.returncode})")
+
+    def down(self):
+        if os.path.exists(PCSCF_PATH):
+            os.unlink(PCSCF_PATH)
+        if self.sim_server and self.sim_server.poll() is None:
+            self.sim_server.terminate()
+            try:
+                self.sim_server.wait(5)
+            except subprocess.TimeoutExpired:
+                self.sim_server.kill()
+        self.sim_server = None
+        for link in self.links:
+            link.down(self.args.netns if link.cid == 2 else None)
+        self.links = []
+
+
+def wait_for_modem() -> str:
+    """The modem's USB device, once it is there (again) with its AT port."""
+    waited = False
+    while True:
+        try:
+            usbdev = find_modem()
+            at_port(usbdev)
+            if qmi_links(usbdev):
+                break
+        except (OSError, Error):
+            pass
+        if not waited:
+            log("waiting for the modem")
+            waited = True
+        time.sleep(2)
+    if waited:
+        time.sleep(5)  # let it finish enumerating and booting
+    return usbdev
+
+
+def describe(e: Exception) -> str:
+    return f"QMI error: {e.message}" if isinstance(e, GLib.Error) else str(e)
 
 
 def main():
@@ -534,103 +710,30 @@ def main():
         sys.exit("must run as root: qmi-proxy only accepts root clients")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    pcscf_path = os.path.join(RUN_DIR, "pcscf")
-    links: list[Link] = []
-    made_netns = False
-    sim_server = None
-    rc = 0
+    bearer = Bearer(args)
+    delay = RETRY_MIN
     try:
-        usbdev = ensure_usbcomp(find_modem())
-        port = AtPort(at_port(usbdev))
-        try:
-            if args.apn is None or args.apn_data is None:
-                m = re.search(r"\d{6,15}", " ".join(port.command("AT+CIMI")))
-                if not m:
-                    raise Error("AT+CIMI: no IMSI in the response")
-                imsi = m.group(0)
-                bundle, name = find_bundle(imsi, BUNDLES_DEFAULT)
-                log(f"IMSI {imsi}: carrier bundle {name or 'none'}")
-                bundle = bundle or {}
-                if args.apn is None:
-                    args.apn = bundle.get("apn", "ims")
-                if args.apn_data is None:
-                    args.apn_data = bundle.get("apn_data")
-            if args.apn_data:
-                port.command(f'AT+CGDCONT=1,"IPV4V6","{args.apn_data}"')
-            port.command(f'AT+CGDCONT=2,"IPV4V6","{args.apn}"')
-        finally:
-            port.close()
-
-        pairs = qmi_links(usbdev)
-        if len(pairs) < 2:
-            raise Error(f"expected two QMI interfaces, found {len(pairs)}")
-        for (netdev, wdm), cid in zip(pairs, (1, 2)):
-            links.append(Link(netdev, wdm, cid))
-            if cid == 2:
-                links[-1].mark_ims_profile()
-            links[-1].up()
-        inet, ims = links
-
-        pcscfs = ims.pcscfs + [p for p in at_pcscfs(usbdev, 2)
-                               if p not in ims.pcscfs]
-
-        inet.configure([] if args.no_default_route
-                       else default_routes(inet, args.metric), None)
-        if args.netns:
-            if args.netns not in subprocess.run(
-                    ["ip", "netns", "list"], capture_output=True,
-                    text=True).stdout.split():
-                ip("netns", "add", args.netns)
-                made_netns = True
-            ims.configure(default_routes(ims, None), args.netns)
-        else:
-            ims.configure([p for p in pcscfs
-                           if (":" in p and ims.v6) or
-                           (":" not in p and ims.v4)], None)
-
-        print(f"internet: {inet.netdev} "
-              f"{' '.join(filter(None, (inet.v4, inet.v6)))}")
-        print(f"ims:      {ims.netdev} "
-              f"{' '.join(filter(None, (ims.v4, ims.v6)))}"
-              + (f" (netns {args.netns})" if args.netns else ""))
-        print(f"p-cscf:   {' '.join(pcscfs) or 'none found'}", flush=True)
-        if pcscfs:
-            write_pcscf(pcscf_path, pcscfs)
-
-        if not args.no_sim_server:
-            sim_server = subprocess.Popen(
-                [sys.executable, SIM_SERVER, "--port", at_port(usbdev)])
-
-        log("up; Ctrl-C to disconnect")
         while True:
-            time.sleep(POLL)
-            for link in links:
-                link.check()
-            if sim_server and sim_server.poll() is not None:
-                raise Error(f"serial_server.py exited "
-                            f"({sim_server.returncode})")
+            try:
+                bearer.up()
+                delay = RETRY_MIN
+                log("up; Ctrl-C to disconnect")
+                while True:
+                    time.sleep(POLL)
+                    bearer.check()
+            except RETRY_ERRORS as e:
+                # Typically suspend/resume: the modem drops off the bus and
+                # comes back, or the network drops the PDNs meanwhile.
+                log(f"qmi_netdev: {describe(e)}; reconnecting in {delay}s")
+                bearer.down()
+                time.sleep(delay)
+                delay = min(delay * 2, RETRY_MAX)
     except KeyboardInterrupt:
         pass
-    except (OSError, serial.SerialException, Error) as e:
-        log(f"qmi_netdev: {e}")
-        rc = 1
-    except GLib.Error as e:
-        log(f"qmi_netdev: QMI error: {e.message}")
-        rc = 1
     finally:
-        if sim_server and sim_server.poll() is None:
-            sim_server.terminate()
-            try:
-                sim_server.wait(5)
-            except subprocess.TimeoutExpired:
-                sim_server.kill()
-        if os.path.exists(pcscf_path):
-            os.unlink(pcscf_path)
-        for link in links:
-            link.down(args.netns if link.cid == 2 else None)
-        if made_netns:
+        bearer.down()
+        if bearer.made_netns:
             ip("netns", "del", args.netns, check=False)
-    sys.exit(rc)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,11 @@ Same API as server.py (USIM-https-server compatible, plain HTTP):
       The modem's IMEI (AT+CGSN), an extension for mkconfig.
       -> {"imei": "35..."}
 
+  GET /?type=msisdn
+      The SIM's own number (AT+CNUM), else the one given with --msisdn, an
+      extension for mkconfig. 404 when there is neither.
+      -> {"msisdn": "+1..."}
+
   GET /?type=isim
       The ISIM's identities (TS 31.103), an extension for mkconfig.
       -> {"impi": "...", "domain": "...", "impu": ["sip:...", "tel:..."]}
@@ -67,6 +72,13 @@ from urllib.parse import parse_qs, urlparse
 
 import serial
 
+try:
+    import termios
+    # pyserial raises termios.error (not OSError) once the tty is gone
+    PORT_ERRORS = (OSError, serial.SerialException, termios.error)
+except ImportError:  # Windows
+    PORT_ERRORS = (OSError, serial.SerialException)
+
 USIM_AID_PREFIX = bytes.fromhex("A0000000871002")
 ISIM_AID_PREFIX = bytes.fromhex("A0000000871004")
 
@@ -107,14 +119,14 @@ class AtPort:
     def _open(self):
         try:
             self.ser = serial.Serial(self.path, 115200, timeout=0.1)
-        except (OSError, serial.SerialException) as e:
+        except PORT_ERRORS as e:
             raise CardError(f"cannot open {self.path}: {e}")
         for cmd in ("ATE0", "AT+CMEE=2"):
             try:
                 self._command(cmd, 2)
             except CardError:
                 pass  # not fatal, the parser copes with echo and plain ERROR
-            except (OSError, serial.SerialException) as e:
+            except PORT_ERRORS as e:
                 self.close()
                 raise CardError(f"{self.path}: {e}")
 
@@ -122,7 +134,7 @@ class AtPort:
         if self.ser:
             try:
                 self.ser.close()
-            except (OSError, serial.SerialException):
+            except PORT_ERRORS:
                 pass
             self.ser = None
 
@@ -158,13 +170,13 @@ class AtPort:
             self._open()
         try:
             return self._command(cmd, timeout)
-        except (OSError, serial.SerialException):
+        except PORT_ERRORS:
             # The device went away; reopen once (same path, ideally by-id).
             self.close()
             self._open()
             try:
                 return self._command(cmd, timeout)
-            except (OSError, serial.SerialException) as e:
+            except PORT_ERRORS as e:
                 self.close()
                 raise CardError(f"{self.path}: {e}")
 
@@ -546,6 +558,20 @@ class Usim:
                 return m.group(1)
         raise CardError(f"AT+CGSN: no IMEI in {lines!r}")
 
+    def msisdn(self) -> str | None:
+        """The first number in AT+CNUM (TS 27.007 7.1), read from EF.MSISDN
+        by the modem."""
+        try:
+            with self.lock:
+                lines = self.port.command("AT+CNUM")
+        except CardError:
+            return None  # e.g. +CME ERROR when the SIM has no EF.MSISDN
+        for line in lines:
+            m = re.match(r'\+CNUM:\s*(?:"[^"]*")?\s*,\s*"(\+?\d+)"', line)
+            if m:
+                return m.group(1)
+        return None
+
     def apdu(self, apdu: bytes) -> dict:
         with self.lock:
             self._select_usim()
@@ -617,6 +643,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(200, self.usim.authenticate(rand, autn, isim))
             elif kind == "imei":
                 self._reply(200, {"imei": self.usim.imei()})
+            elif kind == "msisdn":
+                msisdn = self.usim.msisdn() or self.msisdn
+                if msisdn:
+                    self._reply(200, {"msisdn": msisdn})
+                else:
+                    self._reply(404, {"error": "no MSISDN on the SIM"})
             elif kind == "isim":
                 self._reply(200, self.usim.isim())
             elif kind == "apdu":
@@ -696,6 +728,9 @@ def main():
                     help="listen on TCP HOST:PORT instead of the Unix socket")
     ap.add_argument("--force", action="store_true",
                     help="run even if ModemManager has claimed the port")
+    ap.add_argument("--msisdn", default=None,
+                    help="number for type=msisdn when AT+CNUM has none "
+                         "(qmi_netdev.py passes the modem's, from QMI)")
     ap.add_argument("--probe", action="store_true",
                     help="read the IMSI, then exit")
     args = ap.parse_args()
@@ -738,6 +773,7 @@ def main():
         return
 
     Handler.usim = usim
+    Handler.msisdn = args.msisdn
     try:
         srv, where = make_server(args.listen, args.unix)
     except OSError as e:

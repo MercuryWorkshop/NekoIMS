@@ -16,6 +16,17 @@ runs NekoIMS inside the tunnel's `ims` netns, using the P-CSCF the ePDG
 assigned. It asks for sudo after building. `./start.sh --help` lists the
 options; arguments after `--` go to nekoims.
 
+### Quick start (Linux, IMS over LTE)
+```
+./start.sh --qmi-ims [--apn ims] [--apn_data vzwinternet]
+```
+Instead of the ePDG, registers over the modem's own IMS PDN.
+
+The SIM server needs the AT port to itself, so stop ModemManager first
+`sudo systemctl stop ModemManager`. 
+
+This option refuses to run while it uses the port. Needs libqmi's GObject bindings and pyserial. 
+
 ### Quick start (Windows, VoWiFi)
 ```
 powershell -ExecutionPolicy Bypass -File start.ps1

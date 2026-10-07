@@ -331,12 +331,16 @@ if [ "$WATCH" = 1 ]; then
 fi
 
 while :; do
-	for _ in $(seq $((DIAL_TIMEOUT * 5))); do
-		[ -s "$PCSCF_FILE" ] && break
+	# qmi_netdev keeps reconnecting (e.g. after suspend) for as long as it
+	# runs, so wait for it without a timeout.
+	[ -s "$PCSCF_FILE" ] || log "waiting for $DIAL_WHAT"
+	N=0
+	until [ -s "$PCSCF_FILE" ]; do
 		kill -0 "$DIAL_PID" 2>/dev/null || die "dialer exited"
+		[ "$QMI" = 1 ] || [ $((N += 1)) -le $((DIAL_TIMEOUT * 5)) ] ||
+			die "no tunnel after ${DIAL_TIMEOUT}s"
 		sleep 0.2
 	done
-	[ -s "$PCSCF_FILE" ] || die "no tunnel after ${DIAL_TIMEOUT}s"
 	STAMP=$(mtime) TUNNEL=$(tunnel_id)
 	rm -f "$REASON_FILE"
 

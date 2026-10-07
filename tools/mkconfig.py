@@ -290,7 +290,7 @@ def impu_number(impus: list[str]) -> str | None:
 
 def server_identity(where: str) -> dict:
     """The IMSI from a SIM server that is already running (e.g.
-    serial_server.py), plus the IMEI and ISIM identities where it offers
+    serial_server.py), plus the IMEI, MSISDN and ISIM identities where it offers
     them; its APDU passthrough can't hold an EF selection across requests."""
     class UnixConn(http.client.HTTPConnection):
         def connect(self):
@@ -322,7 +322,7 @@ def server_identity(where: str) -> dict:
              "imei": None, "numbers": []}
 
     # Extensions of serial_server.py; the other servers answer 400.
-    for kind in ("imei", "isim"):
+    for kind in ("imei", "msisdn", "isim"):
         try:
             status, body = get(kind)
         except (OSError, ValueError):
@@ -333,6 +333,8 @@ def server_identity(where: str) -> dict:
             continue
         if kind == "imei":
             ident["imei"] = body.get("imei")
+        elif kind == "msisdn":
+            ident["numbers"] = [body["msisdn"]] if body.get("msisdn") else []
         else:
             ident["impi"] = body.get("impi")
             ident["home_domain"] = body.get("domain")
