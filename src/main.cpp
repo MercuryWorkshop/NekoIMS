@@ -345,6 +345,7 @@ std::string baresip_config(const Settings& s) {
         c << "module\taubridge.so\n";
 
     c << "module\tg711.so\n"
+      << "module\tlibg722.so\n"
       << "module\tamr.so\n"
       << "module\tauconv.so\n"
       << "module\tauresamp.so\n"

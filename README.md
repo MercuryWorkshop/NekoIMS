@@ -133,7 +133,8 @@ card. This is useful for peering with asterisk or using gnome-calls or another s
 * `netns` (Linux): network namespace `listen` is in, as a path
   (`/proc/1/ns/net` for the host's) or a name from `/run/netns`.
 * `audio_codecs`: codecs offered to the external UA (default
-  `PCMU/8000,PCMA/8000`; `AMR-WB/16000` and `AMR/8000` also available)
+  `PCMU/8000,PCMA/8000`; `AMR-WB/16000`, `AMR/8000` and `G722/16000` also
+  available)
 
 On Windows, set `listen` to the LAN address (or `127.0.0.1` for a softphone
 on the same machine). Network namespaces are not used on windows, you do not need to set netns (nor is that option supported).

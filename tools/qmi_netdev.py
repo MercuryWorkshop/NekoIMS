@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import json
 import ipaddress
 import os
 import re
@@ -130,6 +131,26 @@ def at_port(usbdev: str) -> str:
             for tty in glob.glob(f"{iface}/ttyUSB*"):
                 return "/dev/" + os.path.basename(tty)
     raise Error(f"no AT port (interface {AT_INTERFACE}) on {usbdev}")
+
+
+def reclaim_netdevs(usbdev: str, netns: str):
+    """Move the modem's interfaces back out of the netns, where a previous
+    run that was killed (or a teardown that failed) left them; sysfs only
+    shows the netdevs of our own namespace, so qmi_links would miss them."""
+    r = subprocess.run(["ip", "-n", netns, "-j", "link", "show"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        return  # no such netns yet
+    for name in (l["ifname"] for l in json.loads(r.stdout or "[]")):
+        dev = subprocess.run(
+            ["ip", "netns", "exec", netns, "readlink", "-f",
+             f"/sys/class/net/{name}/device"],
+            capture_output=True, text=True).stdout.strip()
+        if dev.startswith(usbdev + "/"):
+            log(f"{name}: moving it back from netns {netns}")
+            ip("-n", netns, "addr", "flush", "dev", name, check=False)
+            ip("-n", netns, "link", "set", name, "down", check=False)
+            ip("-n", netns, "link", "set", name, "netns", "1")
 
 
 def qmi_links(usbdev: str) -> list[tuple[str, str]]:
@@ -595,6 +616,8 @@ class Bearer:
         finally:
             port.close()
 
+        if args.netns:
+            reclaim_netdevs(usbdev, args.netns)
         pairs = qmi_links(usbdev)
         if len(pairs) < 2:
             raise Error(f"expected two QMI interfaces, found {len(pairs)}")

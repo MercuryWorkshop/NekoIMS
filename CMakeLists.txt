@@ -63,6 +63,8 @@ set(PCSCLITE_VERSION    2.5.2)
 set(PCSCLITE_SHA256     60a08942d8c00a1d86a3bf4c64eddbf7a5569c7c54f6904e3f07801bb5316acd)
 set(ALSA_LIB_VERSION    1.2.16.1)
 set(ALSA_LIB_SHA256     f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e)
+set(LIBG722_VERSION     1.2.8)
+set(LIBG722_SHA256      953bf2ead9b0b0dde32fcbc022a2cf5029155405737eba203499e30b18610706)
 
 ##############################################################################
 #
@@ -287,6 +289,29 @@ endif()
 
 ##############################################################################
 #
+# libg722 (G.722 for baresip's libg722 module; the spandsp one can't be
+# linked statically on most distros). Two C files, built here rather than
+# with its own CMakeLists, which wants a shared library and tests.
+#
+
+FetchContent_Declare(libg722
+  URL https://github.com/sippy/libg722/archive/refs/tags/v${LIBG722_VERSION}.tar.gz
+  URL_HASH SHA256=${LIBG722_SHA256}
+  SOURCE_SUBDIR no-cmake  # download only
+)
+FetchContent_MakeAvailable(libg722)
+add_library(sippy_g722 STATIC
+  ${libg722_SOURCE_DIR}/g722_decode.c
+  ${libg722_SOURCE_DIR}/g722_encode.c
+)
+target_include_directories(sippy_g722 PUBLIC ${libg722_SOURCE_DIR})
+add_library(LIBG722::LIBG722 ALIAS sippy_g722)
+# Found already, for baresip's FindLIBG722
+set(LIBG722_INCLUDE_DIR ${libg722_SOURCE_DIR} CACHE PATH "" FORCE)
+set(LIBG722_LIBRARY sippy_g722 CACHE STRING "" FORCE)
+
+##############################################################################
+#
 # baresip (static, modules compiled into libbaresip)
 #
 
@@ -310,6 +335,7 @@ set(MODULES
   ctrl_tcp
   g711
   httpd
+  libg722
   menu
   CACHE STRING "baresip modules linked into NekoIMS" FORCE
 )
