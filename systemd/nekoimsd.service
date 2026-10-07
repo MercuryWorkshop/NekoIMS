@@ -1,0 +1,32 @@
+# NekoIMS over the modem's LTE IMS PDN (start.sh --qmi-ims)
+#
+# To install, run
+#   sed "s|@REPO@|$PWD|g" systemd/nekoimsd.service |
+#       sudo tee /etc/systemd/system/nekoimsd.service >/dev/null
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nekoimsd
+#
+# build/nekoims must already be built (as your user): start.sh would
+# otherwise build it as root.
+
+[Unit]
+Description=NekoIMS (IMS over LTE, B2BUA)
+Wants=network-online.target
+After=network-online.target ModemManager.service
+# The SIM server needs the modem's AT port to itself.
+Conflicts=ModemManager.service
+
+[Service]
+Type=exec
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/start.sh --qmi-ims --config /etc/nekoims/config.json
+# start.sh, qmi_netdev and nekoims all get SIGTERM: nekoims deregisters,
+# qmi_netdev hangs up the PDNs, start.sh cleans up after them.
+KillMode=control-group
+TimeoutStopSec=30
+# start.sh exits 130 from its INT/TERM trap
+SuccessExitStatus=130 143
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
