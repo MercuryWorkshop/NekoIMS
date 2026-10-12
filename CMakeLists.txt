@@ -269,9 +269,16 @@ set(LIBRE_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
 set(USE_OPENSSL OFF CACHE BOOL "" FORCE)
 
+# Local patches for baresip/re
+find_package(Git REQUIRED)
+file(GLOB RE_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/re/*.patch")
+list(SORT RE_PATCHES)
+
 FetchContent_Declare(re
   URL https://github.com/baresip/re/archive/refs/tags/v${RE_VERSION}.tar.gz
   URL_HASH SHA256=${RE_SHA256}
+  PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_DIR=<SOURCE_DIR>/.nogit
+                ${GIT_EXECUTABLE} apply --verbose ${BARESIP_PATCHES}
   EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(re)
