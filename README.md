@@ -40,6 +40,25 @@ mkconfig, dials the ePDG and runs NekoIMS. `Get-Help .\start.ps1` or the top
 of the file lists the options; arguments after `--` go to nekoims. Python 3
 with pyscard is needed for the SIM server and mkconfig.
 
+### Quick start (Windows, IMS over LTE)
+```
+powershell -ExecutionPolicy Bypass -File start.ps1 -MbimIms [-Apn ims]
+```
+Instead of the ePDG, registers over the modem's own IMS PDN, with the modem
+on Windows' inbox MBIM driver (no AT port or vendor driver needed).
+`tools/mbim_ims.py` asks Windows for a second bearer on the IMS APN (an
+additional PDP context next to its own internet connection, which gets a
+"Cellular N" adapter of its own), gets the P-CSCF from the PDN over DHCPv6 and
+serves the modem's SIM over QMI UIM, which the modem carries in its
+QMI-over-MBIM device service. Tested with the Dell DW5811e (Sierra EM7455) on
+Verizon. Needs pywinrt:
+```
+python -m pip install winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Networking.Connectivity winrt-Windows.Networking.NetworkOperators winrt-Windows.Storage.Streams
+```
+The IMS adapter gets a high IPv6 metric so its default route doesn't take
+over, and only the address the network assigned is used as a source (not the
+SLAAC/temporary ones Windows adds), so NekoIMS's SIP and RTP leave from it.
+
 Windows on ARM uses the x86_64 strongSwan build due to what seems to be a compiler but on llvm arm64 windows targets with varargs. NekoIMS itself builds natively.
 `sec_agree` (IMS IPsec, needed by AT&T) is not implemented on Windows yet.
 

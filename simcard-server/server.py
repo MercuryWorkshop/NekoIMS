@@ -49,8 +49,6 @@ import threading
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
-from smartcard.System import readers
-
 USIM_AID_PREFIX = bytes.fromhex("A0000000871002")
 ISIM_AID_PREFIX = bytes.fromhex("A0000000871004")
 
@@ -73,6 +71,9 @@ class Usim:
     # -- low level ---------------------------------------------------------
 
     def _connect(self):
+        # Here, not at the top: tools/mbim_ims.py reuses this class with its
+        # own transport and has no pyscard
+        from smartcard.System import readers
         rlist = readers()
         if not rlist:
             raise CardError("no PC/SC readers")

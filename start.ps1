@@ -3,12 +3,19 @@
 # start.ps1: the Windows counterpart of start.sh. Builds NekoIMS if needed,
 # starts the SIM server (or uses one already running), writes the config,
 # dials the ePDG with the Windows build of neko-strongswan (charon-svc,
-# kernel-libipsec on a Wintun adapter) and runs NekoIMS over the tunnel.
+# kernel-libipsec on a Wintun adapter) and runs NekoIMS over the tunnel. Or,
+# with -MbimIms, registers over the modem's own IMS PDN instead (VoLTE).
 #
 #   .\start.ps1 [options] [-- nekoims args...]
 #
 #   -Sim pcsc|server  SIM backend (default: a SIM server already answering on
 #                     -SimServer, else the PC/SC reader)
+#   -MbimIms          use IMS over LTE instead of the ePDG: tools/mbim_ims.py
+#                     brings up the IMS PDN as a second bearer on the MBIM
+#                     modem (Windows multi-PDP, next to its internet
+#                     connection), gets the P-CSCF over DHCPv6 and serves the
+#                     modem's SIM (QMI UIM over MBIM) on -SimServer
+#   -Apn APN          IMS APN for -MbimIms (default: the carrier bundle's)
 #   -Reader N         PC/SC reader index (pcsc)
 #   -SimServer URL    SIM server to use or start (default:
 #                     http://127.0.0.1:8888), e.g. http://host:5309 for a
@@ -33,6 +40,8 @@ param(
     [string] $Remote = "",
     [string] $Charon = "",
     [switch] $Rebuild,
+    [switch] $MbimIms,
+    [string] $Apn = "",
     [Parameter(ValueFromRemainingArguments = $true)] [string[]] $NekoArgs
 )
 
@@ -43,6 +52,7 @@ $RunDir = Join-Path $env:ProgramData "NekoIMS"
 $PcscfFile = Join-Path $RunDir "pcscf"
 $RemoteDefault = "https://github.com/MercuryWorkshop/neko-strongswan/releases/latest/download/windows-strongswan-{arch}.zip"
 $DialTimeout = 90
+$MbimTimeout = 120  # SIM server, the PDN and DHCPv6
 if ($NekoArgs -and $NekoArgs[0] -eq "--") { $NekoArgs = $NekoArgs[1..($NekoArgs.Count)] }
 if (-not $NekoArgs) { $NekoArgs = @() }
 
@@ -50,6 +60,13 @@ function Log($msg) { [Console]::Error.WriteLine("start.ps1: $msg") }
 function Die($msg) { Log $msg; exit 1 }
 
 if ($Remote -and $Charon) { Die "-Remote and -Charon are exclusive" }
+if ($MbimIms) {
+    if ($Sim -eq "pcsc") { Die "-MbimIms uses the modem's SIM, drop -Sim" }
+    if ($Remote -or $Charon) { Die "-Remote and -Charon are for the ePDG, not -MbimIms" }
+} elseif ($Apn) {
+    Die "-Apn needs -MbimIms"
+}
+$DialWhat = if ($MbimIms) { "the LTE IMS bearer" } else { "the ePDG tunnel" }
 
 function Find-Python {
     foreach ($p in @("python", "py")) {
@@ -101,6 +118,10 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     foreach ($k in $PSBoundParameters.Keys) {
         $v = $PSBoundParameters[$k]
         if ($k -eq "Rebuild" -or $k -eq "NekoArgs") { continue }
+        if ($v -is [switch]) {
+            if ($v) { $argv += "-$k" }
+            continue
+        }
         $argv += "-$k"
         $argv += "`"$v`""
     }
@@ -123,7 +144,7 @@ function Stop-All {
         Stop-Process -Id $script:NekoProc.Id -Force -ErrorAction SilentlyContinue
     }
     if ($script:DialProc -and -not $script:DialProc.HasExited) {
-        Log "hanging up the ePDG tunnel"
+        Log "hanging up $DialWhat"
         # --lifeline: the dialer hangs up when its stdin closes
         try { $script:DialProc.StandardInput.Close() } catch {}
         if (-not $script:DialProc.WaitForExit(20000)) {
@@ -138,7 +159,7 @@ function Stop-All {
 
 # Dialers a previous run left behind would fight over charon and Wintun
 $leftover = Get-CimInstance Win32_Process -Filter "Name like 'python%' or Name = 'py.exe'" |
-    Where-Object { $_.CommandLine -like "*strongswan-dialer.py*" }
+    Where-Object { $_.CommandLine -like "*strongswan-dialer.py*" -or $_.CommandLine -like "*mbim_ims.py*" }
 if ($leftover) { Die "a dialer is already running (pid $($leftover.ProcessId -join ' ')), stop it first" }
 
 try {
@@ -150,6 +171,48 @@ function Test-Sim {
         $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "$SimServer/?type=imsi"
         return $r.StatusCode -eq 200
     } catch { return $false }
+}
+
+function Start-Dialer($argList) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Python
+    $psi.Arguments = $argList -join " "
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true  # --lifeline
+    $script:DialProc = [System.Diagnostics.Process]::Start($psi)
+}
+
+function Test-Pcscf { (Test-Path $PcscfFile) -and (Get-Item $PcscfFile).Length }
+
+# -MbimIms: mbim_ims.py is the SIM server too, and serves the SIM before it
+# dials, so it starts first.
+if ($MbimIms) {
+    & $Python -c "import winrt.windows.foundation.collections, winrt.windows.networking.connectivity, winrt.windows.networking.networkoperators, winrt.windows.storage.streams" 2>$null
+    if ($LASTEXITCODE) {
+        Die "-MbimIms needs pywinrt: $Python -m pip install winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Networking.Connectivity winrt-Windows.Networking.NetworkOperators winrt-Windows.Storage.Streams"
+    }
+    $u = [Uri]$SimServer
+    if ($u.Host -ne "127.0.0.1" -and $u.Host -ne "localhost") {
+        Die "-MbimIms serves the SIM itself, -SimServer must be local"
+    }
+    if (Test-Sim) { Die "a SIM server is already answering on $SimServer, stop it first" }
+    $DialLog = Join-Path $RunDir "mbim_ims.log"
+    Remove-Item $PcscfFile, $DialLog -ErrorAction SilentlyContinue
+    $mbimArgs = @("`"$Repo\tools\mbim_ims.py`"", "--listen", "127.0.0.1:$($u.Port)",
+                  "--log", "`"$DialLog`"", "--lifeline")
+    if ($Apn) { $mbimArgs += @("--apn", $Apn) }
+    Log "bringing up the LTE IMS bearer (log: $DialLog)"
+    Start-Dialer $mbimArgs
+    for ($i = 0; $i -lt $MbimTimeout * 5 -and -not ((Test-Pcscf) -and (Test-Sim)); $i++) {
+        if ($script:DialProc.HasExited) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not ((Test-Pcscf) -and (Test-Sim))) {
+        if (Test-Path $DialLog) { Get-Content $DialLog -Tail 25 | Write-Host }
+        Die "no P-CSCF and SIM server from mbim_ims"
+    }
+    Get-Content $DialLog | Where-Object { $_ -match "^(ims|p-cscf): " } | Write-Host
+    $Sim = "server"
 }
 
 $SimUp = Test-Sim
@@ -194,39 +257,38 @@ if (-not $Config) {
 }
 if (-not (Test-Path $Config)) { Die "config $Config not found" }
 if ((Get-Content $Config -Raw | ConvertFrom-Json).pcscf) {
-    Log "note: $Config sets `"pcscf`", the one the ePDG assigns is used instead"
+    Log "note: $Config sets `"pcscf`", the one $DialWhat assigns is used instead"
 }
 
 # -- 4. dial -----------------------------------------------------------------------
 
-$DialLog = Join-Path $RunDir "dialer.log"
-Remove-Item $PcscfFile, $DialLog -ErrorAction SilentlyContinue
-$dialArgs = @("`"$Repo\dialers\strongswan-dialer.py`"", "--simcard", $SimServer,
-              "--log", "`"$DialLog`"", "--lifeline") + $DialerHints
-if ($Charon) { $dialArgs += @("--charon", "`"$Charon`"") }
-else { $dialArgs += @("--remote", $(if ($Remote) { $Remote } else { $RemoteDefault })) }
-
-Log "dialing the ePDG (log: $DialLog)"
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $Python
-$psi.Arguments = $dialArgs -join " "
-$psi.UseShellExecute = $false
-$psi.RedirectStandardInput = $true
-$script:DialProc = [System.Diagnostics.Process]::Start($psi)
-
+# mbim_ims.py keeps reconnecting (e.g. after suspend) for as long as it runs,
+# so with -MbimIms there is no timeout.
 function Wait-Tunnel {
-    for ($i = 0; $i -lt $DialTimeout * 5; $i++) {
-        if ((Test-Path $PcscfFile) -and (Get-Item $PcscfFile).Length) { return $true }
+    for ($i = 0; $MbimIms -or $i -lt $DialTimeout * 5; $i++) {
+        if (Test-Pcscf) { return $true }
         if ($script:DialProc.HasExited) { return $false }
         Start-Sleep -Milliseconds 200
     }
     return $false
 }
-if (-not (Wait-Tunnel)) {
-    if (Test-Path $DialLog) { Get-Content $DialLog -Tail 25 | Write-Host }
-    Die "no tunnel / P-CSCF from the ePDG"
+
+if (-not $MbimIms) {
+    $DialLog = Join-Path $RunDir "dialer.log"
+    Remove-Item $PcscfFile, $DialLog -ErrorAction SilentlyContinue
+    $dialArgs = @("`"$Repo\dialers\strongswan-dialer.py`"", "--simcard", $SimServer,
+                  "--log", "`"$DialLog`"", "--lifeline") + $DialerHints
+    if ($Charon) { $dialArgs += @("--charon", "`"$Charon`"") }
+    else { $dialArgs += @("--remote", $(if ($Remote) { $Remote } else { $RemoteDefault })) }
+
+    Log "dialing the ePDG (log: $DialLog)"
+    Start-Dialer $dialArgs
+    if (-not (Wait-Tunnel)) {
+        if (Test-Path $DialLog) { Get-Content $DialLog -Tail 25 | Write-Host }
+        Die "no tunnel / P-CSCF from the ePDG"
+    }
+    Get-Content $DialLog | Where-Object { $_ -like "tunnel up*" } | Write-Host
 }
-Get-Content $DialLog | Where-Object { $_ -like "tunnel up*" } | Write-Host
 Log "P-CSCF: $(Get-Content $PcscfFile -TotalCount 1)"
 
 # Incoming calls and the external UA (B2BUA mode) reach NekoIMS unsolicited
@@ -244,12 +306,19 @@ function Tunnel-Id {
 }
 
 while ($true) {
-    if (-not (Wait-Tunnel)) { Die "the dialer exited or the tunnel did not come back" }
+    if (-not (Wait-Tunnel)) { Die "the dialer exited or $DialWhat did not come back" }
     $tunnel = Tunnel-Id
     Log "starting NekoIMS"
     # -p explicitly, not the P-CSCF file: older builds look in /run/nekoims
     $pcscf = (Get-Content $PcscfFile -TotalCount 1).Trim()
-    $nekoArgv = @("-c", "`"$Config`"", "-p", $pcscf) + $NekoArgs
+    $nekoArgv = @("-c", "`"$Config`"", "-p", $pcscf)
+    # -MbimIms: SIP and media on the IMS PDN's address, Windows would route
+    # the P-CSCF from Wi-Fi's otherwise
+    $addrFile = Join-Path $RunDir "ims-address"
+    if ($MbimIms -and (Test-Path $addrFile)) {
+        $nekoArgv += @("-l", (Get-Content $addrFile -TotalCount 1).Trim())
+    }
+    $nekoArgv += $NekoArgs
     $script:NekoProc = Start-Process $Nekoims -ArgumentList $nekoArgv -NoNewWindow -PassThru
     $null = $script:NekoProc.Handle  # else ExitCode stays empty after it exits
     $changed = $false
@@ -262,7 +331,7 @@ while ($true) {
         $script:NekoProc.WaitForExit()
         exit $script:NekoProc.ExitCode
     }
-    Log "the ePDG tunnel changed, restarting NekoIMS"
+    Log "$DialWhat changed, restarting NekoIMS"
     Stop-Process -Id $script:NekoProc.Id -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
 }

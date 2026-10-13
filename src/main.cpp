@@ -41,6 +41,7 @@ struct Settings {
     unsigned pcscf_port = 5060;
     std::string transport = "udp";
     std::string ifname;        // tunnel interface (optional)
+    std::string local_addr;    // -l: the IMS side's address (optional)
     bool sec_agree = false;  // IMS IPsec, see ImsRegConfig
     // IMS leg codecs. baresip's AMR encoder ignores mode-set and sends
     // AMR-WB mode 8 / AMR MR122, so a network that restricts AMR modes (AT&T
@@ -75,10 +76,13 @@ std::string g_bye_hdrs;  // see bye_headers_handler()
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "NekoIMS %s\n"
-                 "Usage: %s [-c config.json] [-p pcscf] [-v] [-t] [-h]\n"
+                 "Usage: %s [-c config.json] [-p pcscf] [-l addr] [-v] [-t] [-h]\n"
                  "  -c <path>  Config file (default: %s)\n"
                  "  -p <addr>  P-CSCF (overrides config; default: config, then\n"
                  "             the first line of %s)\n"
+                 "  -l <addr>  Local IMS address: the IMS side's SIP and media\n"
+                 "             only there, on sip_port (overrides sip_listen;\n"
+                 "             in B2BUA mode next to b2bua.listen)\n"
                  "  -v         Verbose/debug logging\n"
                  "  -t         SIP trace\n"
                  "  -h         Show this help\n",
@@ -487,12 +491,15 @@ int main(int argc, char* argv[]) {
     bool verbose = false;
     bool trace = false;
     std::string pcscf;
+    std::string local;
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-c") && i + 1 < argc) {
             config_path = argv[++i];
         } else if (!std::strcmp(argv[i], "-p") && i + 1 < argc) {
             pcscf = argv[++i];
+        } else if (!std::strcmp(argv[i], "-l") && i + 1 < argc) {
+            local = argv[++i];
         } else if (!std::strcmp(argv[i], "-v")) {
             verbose = true;
         } else if (!std::strcmp(argv[i], "-t")) {
@@ -518,6 +525,24 @@ int main(int argc, char* argv[]) {
     Settings settings;
     if (!load_settings(config_path, settings)) return EXIT_FAILURE;
     if (!pcscf.empty()) settings.pcscf = pcscf;
+    if (!local.empty()) {
+        settings.local_addr = local;
+        // b2bua.listen keeps the port on every address it leaves baresip
+        // (the listen address and this one), see main() below
+        if (!settings.b2bua) {
+            const bool v6 = local.find(':') != std::string::npos;
+            std::ostringstream l;
+            l << (v6 ? "[" : "") << local << (v6 ? "]:" : ":")
+              << settings.sip_port;
+            settings.sip_listen = l.str();
+        } else if (settings.b2bua_cfg.listen.empty()) {
+            std::fprintf(stderr,
+                         "nekoims: -l in B2BUA mode needs b2bua.listen (the "
+                         "external UA's address) in %s\n",
+                         config_path.c_str());
+            return EXIT_FAILURE;
+        }
+    }
     if (settings.pcscf.empty() &&
         read_pcscf_file(pcscf_path, settings.pcscf))
         std::fprintf(stderr, "nekoims: using P-CSCF %s from %s\n",
@@ -679,7 +704,17 @@ int main(int argc, char* argv[]) {
             goto out;
         }
 
-        if (!settings.ifname.empty()) {
+        if (!settings.local_addr.empty()) {
+            Laddr l;
+            l.ifname = "ims";
+            if (sa_set_str(&l.sa, settings.local_addr.c_str(), 0)) {
+                warning("nekoims: -l must be an IP address: %s\n",
+                        settings.local_addr.c_str());
+                err = EINVAL;
+                goto out;
+            }
+            ims.push_back(l);
+        } else if (!settings.ifname.empty()) {
             net_laddr_apply(net, collect_laddr, &ims);
         } else {
             Laddr l;
@@ -787,11 +822,16 @@ int main(int argc, char* argv[]) {
     // This is not okay since the PCSCF route (through the ePDG ) is
     // not the default route. Since Windows doesn't support network 
     // namespaces, we have to patch BareSIP to state the known VPN
-    // address instead of the default route.
+    // address instead of the default route. With -l that is the address:
+    // Windows may route the P-CSCF from another interface when the source
+    // is left open (Wi-Fi next to an LTE IMS PDN).
     {
         struct sa pcscf, media;
-        if (!sa_set_str(&pcscf, settings.pcscf.c_str(), settings.pcscf_port) &&
-            !net_dst_source_addr_get(&pcscf, &media)) {
+        if (!settings.local_addr.empty()
+                ? !sa_set_str(&media, settings.local_addr.c_str(), 0)
+                : (!sa_set_str(&pcscf, settings.pcscf.c_str(),
+                               settings.pcscf_port) &&
+                   !net_dst_source_addr_get(&pcscf, &media))) {
             ua_set_media_laddr(ua, &media);
             info("nekoims: IMS media on %j\n", &media);
         }
