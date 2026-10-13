@@ -1,0 +1,25 @@
+From 00f8c779cfa39ae0b252b7a019f3cf77a1ab89f0 Mon Sep 17 00:00:00 2001
+From: Jack <41519857+ExtremelyLazyCat@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 02:21:21 -0600
+Subject: [PATCH] sipsess: properly CRLF terminate RAck header
+
+---
+ src/sipsess/prack.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/sipsess/prack.c b/src/sipsess/prack.c
+index 81a5971..16dd6dd 100644
+--- a/src/sipsess/prack.c
++++ b/src/sipsess/prack.c
+@@ -138,7 +138,7 @@ static int prack_request(struct sipsess_prack *prack)
+ 	return sip_drequestf(&req->req, req->sess->sip, true, "PRACK",
+ 			     req->sess->dlg, 0, req->sess->auth, NULL,
+ 			     prack_resp_handler, prack,
+-			     "RAck: %s\n"
++			     "RAck: %s\r\n"
+ 			     "%s%s%s"
+ 			     "Content-Length: %zu\r\n"
+ 			     "\r\n"
+-- 
+2.53.0
+

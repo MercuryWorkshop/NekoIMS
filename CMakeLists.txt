@@ -278,7 +278,7 @@ FetchContent_Declare(re
   URL https://github.com/baresip/re/archive/refs/tags/v${RE_VERSION}.tar.gz
   URL_HASH SHA256=${RE_SHA256}
   PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_DIR=<SOURCE_DIR>/.nogit
-                ${GIT_EXECUTABLE} apply --verbose ${BARESIP_PATCHES}
+                ${GIT_EXECUTABLE} apply --verbose ${RE_PATCHES}
   EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(re)
