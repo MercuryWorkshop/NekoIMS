@@ -625,6 +625,7 @@ void ImsRegistration::fail(const char* why) {
     auth_failures_ = 0;
     curr_nc_ = 0;
     curr_ch_ = {};
+    std::memset(curr_resp_, 0x00, sizeof(curr_resp_));
     drop_ipsec();
     new_dialog();
 
@@ -647,7 +648,7 @@ void ImsRegistration::timer_handler(void* arg) {
     self->expires_ = self->cfg_.expires;
 
     // re-REGISTER with cached auth info for ipsec-3gpp
-    if (self->cfg_.sec_agree)
+    if (self->cfg_.sec_agree && self->curr_nc_ > 0)
         err = self->send_register(self->build_authorization());
     else
         err = self->send_register(self->empty_authorization());
