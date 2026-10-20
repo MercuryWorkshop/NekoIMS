@@ -451,7 +451,8 @@ void ImsRegistration::on_challenge(const struct sip_msg* msg) {
                  server_.port_s);
     }
 
-    if (!hdr || httpauth_digest_challenge_decode(&hc, &hdr->val)) {
+    if ((!hdr || httpauth_digest_challenge_decode(&hc, &hdr->val)) &&
+        active_ == nullptr) {
         fail("401 without a usable WWW-Authenticate");
         return;
     }
@@ -580,7 +581,7 @@ void ImsRegistration::on_aka(AkaJob* job) {
 
     // TS 33.203 7.2: the SAs go up before the REGISTER that answers the
     // challenge, which then goes to the P-CSCF's protected server port.
-    if (cfg_.sec_agree && r.ok && !r.sync_failure) {
+    if (cfg_.sec_agree && r.ok && !r.sync_failure && active_ == nullptr) {
         if (!have_server_) {
             fail("no usable Security-Server");
             return;
