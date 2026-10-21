@@ -428,7 +428,8 @@ void ImsRegistration::on_challenge(const struct sip_msg* msg) {
     struct httpauth_digest_chall hc;
 
     if (cfg_.sec_agree) {
-        security_verify_.clear();
+        if (active_ == nullptr)
+            security_verify_.clear();
         struct le* le;
         for (le = list_head(&msg->hdrl); le; le = le->next) {
             const struct sip_hdr* h =
