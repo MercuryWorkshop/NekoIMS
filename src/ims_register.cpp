@@ -575,6 +575,7 @@ void ImsRegistration::on_aka(AkaJob* job) {
     std::memcpy(curr_cnonce_, cnonce, sizeof(cnonce));
     std::memcpy(curr_resp_, resp, sizeof(resp));
     curr_ch_ = ch;
+    curr_nc_ = 0;
     std::string auth = build_authorization(auts);
     // A resync isn't a credential failure; the next 401 carries a new vector.
     sent_credentials_ = !r.sync_failure;
