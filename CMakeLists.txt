@@ -51,10 +51,10 @@ string(REPLACE "." "_" CURL_TAG ${CURL_VERSION})
 set(CURL_SHA256         f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7)
 set(JSON_VERSION        3.12.0)
 set(JSON_SHA256         42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa)
-set(RE_VERSION          4.12.0)
-set(RE_SHA256           707b6194dd3b8d3fb1641ca08a0999aaac1d38d36b5c45514777a13ded311923)
-set(BARESIP_VERSION     4.12.0)
-set(BARESIP_SHA256      710d79d60c15c09f0aeb93e5d2f219e7f12ab93f62cab826e4280592a1ea155f)
+set(RE_VERSION          4.13.0)
+set(RE_SHA256           3e62b66cb833f22561ec3351647efb3c488766978d72f56de1039a7e5ddf70a9)
+set(BARESIP_VERSION     4.13.0)
+set(BARESIP_SHA256      688dbb92844340c2dd8dab7d93aaebccb3aa433af9215bb099ca598fafc0e0a2)
 set(OPENCORE_AMR_VERSION 0.1.6)
 set(OPENCORE_AMR_SHA256 483eb4061088e2b34b358e47540b5d495a96cd468e361050fae615b1809dc4a1)
 set(VO_AMRWBENC_VERSION 0.1.3)
@@ -269,16 +269,9 @@ set(LIBRE_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
 set(USE_OPENSSL OFF CACHE BOOL "" FORCE)
 
-# Local patches for baresip/re
-find_package(Git REQUIRED)
-file(GLOB RE_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/re/*.patch")
-list(SORT RE_PATCHES)
-
 FetchContent_Declare(re
   URL https://github.com/baresip/re/archive/refs/tags/v${RE_VERSION}.tar.gz
   URL_HASH SHA256=${RE_SHA256}
-  PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_DIR=<SOURCE_DIR>/.nogit
-                ${GIT_EXECUTABLE} apply --verbose ${RE_PATCHES}
   EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(re)
